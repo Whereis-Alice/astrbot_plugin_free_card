@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from free_card_plugin.card_api import call, update_card, validate_card
+from free_card_plugin.card_api import call, compose_card, update_card, validate_card
 
 
 def member(card="old", **extra):
@@ -134,3 +134,30 @@ def test_transport_timeout_is_bounded(monkeypatch):
     with pytest.raises(TimeoutError):
         asyncio.run(call(SimpleNamespace(call_action=AsyncMock()), "456", "test"))
     assert timeout_values == [10]
+
+
+@pytest.mark.parametrize(
+    "value, base, expected",
+    [
+        ("爱丽丝 摸鱼中", "", "爱丽丝 摸鱼中"),
+        ("摸鱼中", "爱丽丝", "爱丽丝 摸鱼中"),
+        ("爱丽丝 摸鱼中", "爱丽丝", "爱丽丝 摸鱼中"),
+        ("", "爱丽丝", "爱丽丝"),
+        ("爱丽丝", "爱丽丝", "爱丽丝"),
+        ("   摸鱼中 \n", " 爱丽丝 ", "爱丽丝 摸鱼中"),
+        ("AliceX", "Alice", "Alice AliceX"),
+        ("different name", "Alice", "Alice different name"),
+    ],
+)
+def test_final_card_respects_configured_base(value, base, expected):
+    assert compose_card(value, base) == expected
+
+
+def test_final_length_includes_base_separator_and_emoji_bytes():
+    assert compose_card("好" * 16, "爱丽丝") == "爱丽丝 " + "好" * 16
+    with pytest.raises(ValueError, match="太长"):
+        compose_card("好" * 17, "爱丽丝")
+    with pytest.raises(ValueError, match="太长"):
+        compose_card("x" * 29, "Alice")
+    with pytest.raises(ValueError, match="太长"):
+        compose_card("😀" * 13, "爱丽丝")

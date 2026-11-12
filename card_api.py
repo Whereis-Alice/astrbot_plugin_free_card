@@ -26,6 +26,25 @@ def validate_card(value: Any) -> str:
     return name
 
 
+def compose_card(value: Any, base_name: Any = "") -> str:
+    """Keep an optional configured name fixed and validate the final card."""
+    if not isinstance(base_name, str):
+        raise ValueError("基础名字配置无效，请填写文字或留空。")
+    if not base_name.strip():
+        return validate_card(value)
+    base = validate_card(base_name)
+    if not isinstance(value, str):
+        raise ValueError("请提供文字后缀；空字符串表示只显示基础名字。")
+    suffix = " ".join(value.split())
+    # Accept a complete card from an earlier conversation without duplicating
+    # the configured name. Only strip an exact name with a word boundary.
+    if suffix == base:
+        suffix = ""
+    elif suffix.startswith(base + " "):
+        suffix = suffix[len(base) + 1 :]
+    return validate_card(f"{base} {suffix}" if suffix else base)
+
+
 class ApiFailure(Exception):
     pass
 

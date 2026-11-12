@@ -232,7 +232,8 @@ def test_defaults_match_schema():
     schema = json.loads(
         (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
     )
-    assert len(schema) == 3 and schema["reminder_text"]["default"] == DEFAULT_REMINDER
+    assert len(schema) == 4 and schema["reminder_text"]["default"] == DEFAULT_REMINDER
+    assert schema["base_name"]["default"] == ""
 
 
 def test_long_reminder_interval_survives_a_day_of_quiet():
@@ -253,3 +254,75 @@ def test_success_postpones_reminder_even_with_no_write_cooldown(monkeypatch):
     req = request(plugin)
     asyncio.run(plugin.remind(Event(), req))
     assert not req.extra_user_content_parts
+
+
+@pytest.mark.parametrize("card", ["摸鱼中", "爱丽丝 摸鱼中"])
+def test_fixed_base_is_applied_even_without_reminders(monkeypatch, card):
+    write = AsyncMock(return_value=UpdateResult(True, True))
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    plugin, event = make_plugin({"base_name": "爱丽丝", "reminder_interval_minutes": 0}), Event()
+    reply = asyncio.run(plugin.rename(event, card))
+    assert "爱丽丝 摸鱼中" in reply
+    write.assert_awaited_once_with(event.bot, "123", "456", "爱丽丝 摸鱼中")
+
+
+def test_fixed_base_suffixes_replace_each_other(monkeypatch):
+    write = AsyncMock(return_value=UpdateResult(True, True))
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    plugin, event = make_plugin({"base_name": "爱丽丝", "min_update_seconds": 0}), Event()
+    for suffix in ["摸鱼中", "喝茶中", ""]:
+        asyncio.run(plugin.rename(event, suffix))
+    assert [call.args[-1] for call in write.await_args_list] == [
+        "爱丽丝 摸鱼中",
+        "爱丽丝 喝茶中",
+        "爱丽丝",
+    ]
+
+
+def test_empty_base_preserves_full_card_behavior(monkeypatch):
+    write = AsyncMock(return_value=UpdateResult(True, True))
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    plugin, event = make_plugin({"base_name": "  "}), Event()
+    asyncio.run(plugin.rename(event, "任意新名字"))
+    write.assert_awaited_once_with(event.bot, "123", "456", "任意新名字")
+
+
+def test_model_is_told_to_supply_only_suffix_in_fixed_mode():
+    plugin, event = make_plugin({"base_name": "爱丽丝"}), Event()
+    req = request(plugin)
+    asyncio.run(plugin.remind(event, req))
+    assert "基础名字固定为 '爱丽丝'" in req.extra_user_content_parts[0].text
+    assert "只填写后缀" in plugin._tool.parameters["properties"]["card"]["description"]
+    assert "完整文本" not in plugin._tool.description
+    assert list(plugin._tool.parameters["properties"]) == ["card"]
+
+
+def test_each_tool_has_its_own_naming_description():
+    fixed, free = make_plugin({"base_name": "爱丽丝"}), make_plugin()
+    assert "只填写后缀" in fixed._tool.parameters["properties"]["card"]["description"]
+    assert "完整群名片" in free._tool.parameters["properties"]["card"]["description"]
+
+
+def test_clear_base_configuration_restores_full_name_description():
+    plugin = make_plugin({"base_name": "爱丽丝", "reminder_interval_minutes": 0})
+    plugin.config["base_name"] = ""
+    asyncio.run(plugin.remind(Event(), request(plugin)))
+    assert "完整群名片" in plugin._tool.parameters["properties"]["card"]["description"]
+
+
+def test_combined_name_too_long_does_not_write_or_enter_cooldown(monkeypatch):
+    write = AsyncMock()
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    plugin = make_plugin({"base_name": "爱丽丝"})
+    reply = asyncio.run(plugin.rename(Event(), "好" * 17))
+    assert "太长" in reply
+    assert not plugin._states
+    write.assert_not_called()
+
+
+@pytest.mark.parametrize("base", [42, "好" * 21, "bad\x00name"])
+def test_invalid_base_configuration_never_writes(monkeypatch, base):
+    write = AsyncMock()
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    assert "无法修改" in asyncio.run(make_plugin({"base_name": base}).rename(Event(), "新后缀"))
+    write.assert_not_called()

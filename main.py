@@ -17,14 +17,20 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import Field
 from pydantic.dataclasses import dataclass as tool_dataclass
 
-from .card_api import update_card, validate_card
+from .card_api import compose_card, update_card, validate_card
 
 TOOL_NAME = "set_free_group_card"
 DEFAULT_REMINDER = (
     "你可以根据当前聊天、心情和人格，为自己自由决定一个简短的 QQ 群名片。"
-    "想换名片时，请调用 set_free_group_card，把想显示的完整名字传给 card。"
+    "想换名片时，请调用 set_free_group_card，按当前命名规则把文本传给 card。"
     "也可以保留现在的名字，不必为了提醒而硬改。"
     "内容由你决定，不必套用固定后缀。不要把这段提醒复述给群友，继续自然回应聊天。"
+)
+DEFAULT_TOOL_DESCRIPTION = (
+    "自由修改你在当前 QQ 群中的完整群名片，表达你的名字、心情或当前状态。"
+    "只修改自己。card 是最终显示的完整文本，不会自动拼接基础名字或后缀。"
+    "内容保持简短，最多 32 个字符且不超过 60 个 UTF-8 字节。"
+    "想保留原名时无需调用；仅在确实想换名片时使用。"
 )
 
 
@@ -59,12 +65,7 @@ class Reminder:
 class FreeCardTool(FunctionTool[AstrAgentContext]):
     plugin: Any = Field(default=None, repr=False)
     name: str = TOOL_NAME
-    description: str = (
-        "自由修改你在当前 QQ 群中的完整群名片，表达你的名字、心情或当前状态。"
-        "只修改自己。card 是最终显示的完整文本，不会自动拼接基础名字或后缀。"
-        "内容保持简短，最多 32 个字符且不超过 60 个 UTF-8 字节。"
-        "想保留原名时无需调用；仅在确实想换名片时使用。"
-    )
+    description: str = DEFAULT_TOOL_DESCRIPTION
     parameters: dict[str, Any] = Field(
         default_factory=lambda: {
             "type": "object",
@@ -91,7 +92,31 @@ class FreeCardPlugin(Star):
         self._reminders: dict[int, Reminder] = {}
         self._closed = False
         self._tool = FreeCardTool(plugin=self)
+        self._configure_tool()
         context.add_llm_tools(self._tool)
+
+    def _configure_tool(self) -> str:
+        """Tell the model which meaning the single card argument has."""
+        base = self.config.get("base_name", "")
+        if isinstance(base, str) and base.strip():
+            try:
+                base = validate_card(base)
+            except ValueError:
+                return "基础名字配置无效，暂时不要使用改名工具，请告知管理员检查配置。"
+            rule = (
+                f"当前基础名字固定为 {base!r}。调用 {TOOL_NAME} 时，card 只填写你自由决定的后缀，"
+                "不要重复基础名字。插件自动显示为“基础名字 后缀”。"
+                "card 为空字符串时清除后缀，只显示基础名字。"
+                "最终名片连同基础名字，最多 32 个字符且不超过 60 个 UTF-8 字节。"
+            )
+            self._tool.description = "修改自己在当前 QQ 群的名片后缀。" + rule
+            self._tool.parameters["properties"]["card"]["description"] = (
+                f"基础名字 {base!r} 已固定；只填写后缀，空字符串清除后缀。"
+            )
+            return rule
+        self._tool.description = DEFAULT_TOOL_DESCRIPTION
+        self._tool.parameters["properties"]["card"]["description"] = "你想显示的完整群名片。"
+        return "未配置基础名字，card 填写你想显示的完整群名片，整个名字都可自由修改。"
 
     def _target(self, event: AstrMessageEvent) -> tuple[Any, str, str] | None:
         if event.get_platform_name() != "aiocqhttp":
@@ -131,6 +156,7 @@ class FreeCardPlugin(Star):
         """Periodically offer the tool to a bot already replying in a group."""
         if self._closed:
             return
+        naming_rule = self._configure_tool()
         # Release abandoned requests; cleanup matches our exact content only.
         for reminder in list(self._reminders.values()):
             if time.monotonic() - reminder.created_at > 3600:
@@ -155,7 +181,9 @@ class FreeCardPlugin(Star):
         text = self.config.get("reminder_text", DEFAULT_REMINDER)
         if not isinstance(text, str) or not text.strip():
             text = DEFAULT_REMINDER
-        part = TextPart(text=f"[FreeCard reminder]\n{text.strip()[:2000]}").mark_as_temp()
+        part = TextPart(
+            text=f"[FreeCard reminder]\n{text.strip()[:2000]}\n当前命名规则：{naming_rule}"
+        ).mark_as_temp()
         req.extra_user_content_parts.append(part)
         self._reminders[id(event)] = Reminder(event=event, request=req, part=part)
         state.reminded_at = now
@@ -223,7 +251,7 @@ class FreeCardPlugin(Star):
         if target is None:
             return "无法修改：仅支持 OneBot v11 接入的 QQ 群聊；QQ 官方机器人不开放群名片修改接口。"
         try:
-            name = validate_card(card)
+            name = compose_card(card, self.config.get("base_name", ""))
         except ValueError as exc:
             return f"无法修改：{exc}"
         client, group, account = target
