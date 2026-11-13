@@ -1,6 +1,8 @@
 import asyncio
+import importlib
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,6 +11,14 @@ import pytest
 from astrbot.api import FunctionTool, ToolSet
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.pipeline.context import call_event_hook
+from astrbot.core.star.star import star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    StarHandlerRegistry,
+    star_handlers_registry,
+)
 
 from free_card_plugin.card_api import UpdateResult
 from free_card_plugin.main import DEFAULT_REMINDER, TOOL_NAME, FreeCardPlugin, FreeCardTool
@@ -23,6 +33,12 @@ class Event:
             platform,
         )
         self.bot = SimpleNamespace(call_action=AsyncMock())
+        self.plugins_name = None
+        self.stopped = False
+        self.trace = SimpleNamespace(record=lambda *args, **kwargs: None)
+
+    def is_stopped(self):
+        return self.stopped
 
     def get_platform_name(self):
         return self.platform
@@ -80,6 +96,59 @@ def test_elapsed_interval_reminds_again():
     next_req = request(plugin)
     asyncio.run(plugin.remind(Event(), next_req))
     assert len(next_req.extra_user_content_parts) == 1
+
+
+def test_world_reply_gate_does_not_consume_the_next_real_reminder(monkeypatch):
+    plugin = make_plugin()
+    registry = StarHandlerRegistry()
+    reminder = next(h for h in star_handlers_registry
+                    if h.handler_module_path == "free_card_plugin.main" and h.handler_name == "remind")
+    registry.append(replace(reminder, handler=plugin.remind))
+
+    async def world_gate(event, req):
+        if req.prompt == "suppressed":
+            event.stopped = True
+
+    registry.append(StarHandlerMetadata(
+        event_type=EventType.OnLLMRequestEvent,
+        handler_full_name="world_gate", handler_name="world_gate",
+        handler_module_path="test_world_gate", handler=world_gate,
+        event_filters=[], extras_configs={"priority": -1_000_000},
+    ))
+    monkeypatch.setitem(star_map, "test_world_gate", SimpleNamespace(
+        name="my_world", display_name="my_world", activated=True))
+    monkeypatch.setattr(importlib.import_module(call_event_hook.__module__),
+                        "star_handlers_registry", registry)
+
+    async def scenario():
+        blocked = request(plugin)
+        blocked.prompt = "suppressed"
+        assert await call_event_hook(Event(), EventType.OnLLMRequestEvent, blocked)
+        assert not blocked.extra_user_content_parts and not plugin._states
+        allowed = request(plugin)
+        assert not await call_event_hook(Event(), EventType.OnLLMRequestEvent, allowed)
+        assert len(allowed.extra_user_content_parts) == 1
+    asyncio.run(scenario())
+
+
+def test_already_stopped_event_never_consumes_reminder():
+    plugin, event = make_plugin(), Event()
+    event.stopped = True
+    req = request(plugin)
+    asyncio.run(plugin.remind(event, req))
+    assert not req.extra_user_content_parts and not plugin._states
+
+
+def test_reminder_lifecycle_logs_without_logging_prompt(caplog):
+    plugin, event = make_plugin(), Event()
+    req = request(plugin)
+    with caplog.at_level("INFO", logger="astrbot"):
+        asyncio.run(plugin.remind(event, req))
+        asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
+        asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    for label in ("reminder injected", "reminder reached agent", "reminder finished without rename"):
+        assert label in caplog.text
+    assert req.prompt not in caplog.text and DEFAULT_REMINDER not in caplog.text
 
 
 @pytest.mark.parametrize("mode", ["missing", "inactive", "disabled", "official", "private"])

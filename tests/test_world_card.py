@@ -77,6 +77,26 @@ def test_empty_card_uses_nickname_and_restores_exact_empty_value(monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("existing_slot", [False, True])
+def test_tool_read_failure_preserves_world_slots_and_does_not_throw(monkeypatch, existing_slot):
+    async def scenario():
+        plugin, event, situation, updater = fixture(monkeypatch)
+        await plugin.remember_world_target(event)
+        row = next(iter(plugin._world_records.values()))
+        if existing_slot:
+            row["confirmed_slot"] = {"card": "Alice 拜访艾拉", "baseline": "Alice"}
+            situation["presence"] = None
+        original = copy.deepcopy(row)
+        monkeypatch.setattr("free_card_plugin.main.read_member", AsyncMock(side_effect=TimeoutError()))
+        reply = await plugin.rename(event, "Alice New")
+        assert "300 秒" in reply and "回读" in reply
+        assert row.get("confirmed_slot") == original.get("confirmed_slot")
+        assert not row.get("pending_slot")
+        updater.assert_not_awaited()
+        assert "秒后可再修改" in await plugin.rename(event, "Alice Again")
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("applied", [False, True])
 def test_canceled_scene_change_preserves_both_possible_ownership_values(monkeypatch, applied):
     async def scenario():

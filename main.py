@@ -28,6 +28,9 @@ from .world_card import (
 )
 
 TOOL_NAME = "set_free_group_card"
+# AstrBot runs larger priorities first. My World's final reply gate is -1_000_000;
+# requests it suppresses must not consume this plugin's reminder interval.
+REMINDER_HOOK_PRIORITY = -1_000_001
 DEFAULT_REMINDER = (
     "你可以根据当前聊天、心情和人格，为自己自由决定一个简短的 QQ 群名片。"
     "想换名片时，请调用 set_free_group_card，按当前命名规则把文本传给 card。"
@@ -58,6 +61,8 @@ class GroupState:
     reminded_at: float | None = None
     write_after: float = 0
     seen_at: float = field(default_factory=time.monotonic)
+    last_skip_reason: str = ""
+    skip_noticed_at: float = 0
 
 
 @dataclass
@@ -170,10 +175,20 @@ class FreeCardPlugin(WorldCardMixin, Star):
         state.seen_at = now
         return state
 
-    @filter.on_llm_request()
+    def _notice_reminder_skip(self, state: GroupState, group: str, reason: str) -> None:
+        now = time.monotonic()
+        if reason != state.last_skip_reason or now - state.skip_noticed_at >= 600:
+            logger.info("[free_card] reminder skipped group=%s reason=%s", group, reason)
+            state.last_skip_reason = reason
+            state.skip_noticed_at = now
+
+    @filter.on_llm_request(priority=REMINDER_HOOK_PRIORITY)
     async def remind(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """Periodically offer the tool to a bot already replying in a group."""
         if self._closed:
+            return
+        stopped = getattr(event, "is_stopped", None)
+        if callable(stopped) and stopped():
             return
         naming_rule = self._configure_tool()
         # Release abandoned requests; cleanup matches our exact content only.
@@ -184,17 +199,19 @@ class FreeCardPlugin(WorldCardMixin, Star):
         interval = setting_int(self.config, "reminder_interval_minutes", 30, 10080) * 60
         if target is None or interval == 0:
             return
+        _, group, account = target
+        state = self._state(event, group, account)
         try:
             if await self._world_presence(event):
+                self._notice_reminder_skip(state, group, "world_visit_active")
                 return  # Presence is automatically maintained; preserve ordinary chat rhythm.
         except Exception as exc:  # noqa: BLE001 - World startup must not interrupt normal chat.
-            self._world_log("World presence is not ready", exc)
+            self._notice_reminder_skip(state, group, "world_not_ready:" + type(exc).__name__)
             return
         tools = getattr(req.func_tool, "tools", [])
         if not any(tool.name == TOOL_NAME and getattr(tool, "active", True) for tool in tools):
+            self._notice_reminder_skip(state, group, "tool_unavailable")
             return
-        _, group, account = target
-        state = self._state(event, group, account)
         now = time.monotonic()
         if now < state.write_after or (
             state.reminded_at is not None and now - state.reminded_at < interval
@@ -212,6 +229,8 @@ class FreeCardPlugin(WorldCardMixin, Star):
         req.extra_user_content_parts.append(part)
         self._reminders[id(event)] = Reminder(event=event, request=req, part=part)
         state.reminded_at = now
+        state.last_skip_reason = ""
+        logger.info("[free_card] reminder injected group=%s account=%s", group, account)
 
     @filter.on_agent_begin()
     async def bind_reminder(
@@ -221,6 +240,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
     ) -> None:
         if reminder := self._reminders.get(id(event)):
             reminder.run_context = run_context
+            logger.info("[free_card] reminder reached agent group=%s", event.get_group_id())
 
     def _cleanup(self, reminder: Reminder) -> None:
         parts = reminder.request.extra_user_content_parts
@@ -265,6 +285,9 @@ class FreeCardPlugin(WorldCardMixin, Star):
     ) -> None:
         if reminder := self._reminders.get(id(event)):
             reminder.run_context = run_context
+            logger.info(
+                "[free_card] reminder finished without rename group=%s", event.get_group_id()
+            )
             self._cleanup(reminder)
 
     @tracked_write
@@ -272,6 +295,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
         if self._closed:
             return "无法修改：插件已卸载。"
         if reminder := self._reminders.get(id(event)):
+            logger.info("[free_card] reminder reached tool group=%s", event.get_group_id())
             self._cleanup(reminder)
         target = self._target(event)
         if target is None:
@@ -298,13 +322,23 @@ class FreeCardPlugin(WorldCardMixin, Star):
             member = None
             owned = None
             if has_slots:
-                member = await read_member(client, group, account)
+                try:
+                    member = await read_member(client, group, account)
+                except Exception as exc:  # noqa: BLE001 - A failed read must preserve restoration slots.
+                    self._world_log("Group-card read unavailable", exc)
+                    state.write_after = time.monotonic() + 300
+                    return "暂时无法回读当前群名片，已保留恢复记录并暂停尝试 300 秒，请稍后再试。"
                 owned = resolve_slot(world_row, member["card"])
             if presence or has_slots:
                 slot = {"baseline": name, "card": name, "restore": True, "explicit_baseline": True}
                 if presence:
                     if member is None:
-                        member = await read_member(client, group, account)
+                        try:
+                            member = await read_member(client, group, account)
+                        except Exception as exc:  # noqa: BLE001 - Do not overwrite an unread temporary card.
+                            self._world_log("Group-card read unavailable", exc)
+                            state.write_after = time.monotonic() + 300
+                            return "暂时无法回读当前群名片，已暂停尝试 300 秒，请稍后再试。"
                     display = presence_display_base(self.config, presence, member=member, baseline=name)
                     if display is None:
                         return "无法确定串门名片的显示名字，请设置基础名字或检查机器人昵称。"
