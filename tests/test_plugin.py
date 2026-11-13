@@ -41,6 +41,8 @@ def make_plugin(config=None):
     registered = []
     context = SimpleNamespace(add_llm_tools=lambda *tools: registered.extend(tools))
     plugin = FreeCardPlugin(context, config)
+    plugin.put_kv_data = AsyncMock()
+    plugin.get_kv_data = AsyncMock(return_value={})
     assert len(registered) == 1 and registered[0].name == TOOL_NAME
     return plugin
 
@@ -232,8 +234,9 @@ def test_defaults_match_schema():
     schema = json.loads(
         (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
     )
-    assert len(schema) == 4 and schema["reminder_text"]["default"] == DEFAULT_REMINDER
+    assert len(schema) == 5 and schema["reminder_text"]["default"] == DEFAULT_REMINDER
     assert schema["base_name"]["default"] == ""
+    assert schema["world_presence_enabled"]["default"] is True
 
 
 def test_long_reminder_interval_survives_a_day_of_quiet():

@@ -17,7 +17,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import Field
 from pydantic.dataclasses import dataclass as tool_dataclass
 
-from .card_api import compose_card, update_card, validate_card
+from .card_api import compose_card, read_member, update_card, validate_card
+from .world_card import WorldCardMixin, compose_presence, resolve_slot, tracked_write
 
 TOOL_NAME = "set_free_group_card"
 DEFAULT_REMINDER = (
@@ -84,16 +85,27 @@ class FreeCardTool(FunctionTool[AstrAgentContext]):
         return await self.plugin.rename(event, kwargs.get("card"))
 
 
-class FreeCardPlugin(Star):
+class FreeCardPlugin(WorldCardMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context, config)
         self.config = config if config is not None else {}
         self._states: dict[tuple[str, str, str], GroupState] = {}
         self._reminders: dict[int, Reminder] = {}
         self._closed = False
+        self._init_world_cards()
         self._tool = FreeCardTool(plugin=self)
         self._configure_tool()
         context.add_llm_tools(self._tool)
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @tracked_write
+    async def remember_world_target(self, event: AstrMessageEvent) -> None:
+        """Remember exact OneBot targets for automatic temporary world presence."""
+        if self._closed:
+            return
+        target = self._target(event)
+        if target is not None:
+            await self._track_world_target(event, target)
 
     def _configure_tool(self) -> str:
         """Tell the model which meaning the single card argument has."""
@@ -164,6 +176,12 @@ class FreeCardPlugin(Star):
         target = self._target(event)
         interval = setting_int(self.config, "reminder_interval_minutes", 30, 10080) * 60
         if target is None or interval == 0:
+            return
+        try:
+            if await self._world_presence(event):
+                return  # Presence is automatically maintained; preserve ordinary chat rhythm.
+        except Exception as exc:  # noqa: BLE001 - World startup must not interrupt normal chat.
+            self._world_log("World presence is not ready", exc)
             return
         tools = getattr(req.func_tool, "tools", [])
         if not any(tool.name == TOOL_NAME and getattr(tool, "active", True) for tool in tools):
@@ -242,6 +260,7 @@ class FreeCardPlugin(Star):
             reminder.run_context = run_context
             self._cleanup(reminder)
 
+    @tracked_write
     async def rename(self, event: AstrMessageEvent, card: Any) -> str:
         if self._closed:
             return "无法修改：插件已卸载。"
@@ -255,6 +274,7 @@ class FreeCardPlugin(Star):
         except ValueError as exc:
             return f"无法修改：{exc}"
         client, group, account = target
+        world_row = await self._track_world_target(event, target)
         state = self._state(event, group, account)
         async with state.lock:
             if self._closed:
@@ -262,17 +282,35 @@ class FreeCardPlugin(Star):
             now = time.monotonic()
             if now < state.write_after:
                 return f"请保留当前名片，约 {int(state.write_after - now) + 1} 秒后可再修改。"
-            # Reserve before awaiting: cancellation must not cause a write burst.
-            interval = setting_int(self.config, "min_update_seconds", 60, 3600)
-            state.write_after = now + max(5, interval)
             try:
-                result = await update_card(client, group, account, name)
-            except asyncio.CancelledError:
-                # QQ may have applied a request whose response was interrupted.
-                state.write_after = time.monotonic() + 300
-                raise
-            completed_at = time.monotonic()
-            state.write_after = completed_at + (interval if result.accepted else 300)
+                presence = await self._world_presence(event)
+            except Exception as exc:  # noqa: BLE001 - Preserve a pending temporary name while its owner reloads.
+                self._world_log("World presence is not ready", exc)
+                return "小世界正在恢复状态，暂时保留当前名片，稍后再试。"
+            has_slots = bool(world_row.get("confirmed_slot") or world_row.get("pending_slot"))
+            if has_slots:
+                member = await read_member(client, group, account)
+                resolve_slot(world_row, member["card"])
+            if presence or has_slots:
+                slot = {"baseline": name, "card": name, "restore": True}
+                if presence:
+                    slot = {"baseline": name, "card": compose_presence(name, presence["status"]),
+                            "token": presence["token"], "status": presence["status"]}
+                name = slot["card"]
+                result = await self._write_world_slot(client, group, account, world_row, state, slot,
+                                                      updater=update_card)
+                completed_at = time.monotonic()
+            else:
+                # Reserve before awaiting: cancellation must not cause a write burst.
+                interval = setting_int(self.config, "min_update_seconds", 60, 3600)
+                state.write_after = now + max(5, interval)
+                try:
+                    result = await update_card(client, group, account, name)
+                except asyncio.CancelledError:
+                    state.write_after = time.monotonic() + 300
+                    raise
+                completed_at = time.monotonic()
+                state.write_after = completed_at + (interval if result.accepted else 300)
             if result.accepted:
                 state.reminded_at = completed_at
             if result.verified:
@@ -287,6 +325,10 @@ class FreeCardPlugin(Star):
     async def terminate(self) -> None:
         self._closed = True
         self._tool.active = False
-        for reminder in list(self._reminders.values()):
-            self._cleanup(reminder)
-        self._states.clear()
+        try:
+            await self._close_world_cards()
+        finally:
+            self._tool.active = False
+            for reminder in list(self._reminders.values()):
+                self._cleanup(reminder)
+            self._states.clear()

@@ -79,7 +79,7 @@ async def call(client: Any, account: str, action: str, **params: Any) -> Any:
     return payload
 
 
-async def read_card(client: Any, group: str, account: str) -> str:
+async def read_member(client: Any, group: str, account: str) -> dict[str, Any]:
     member = await call(
         client,
         account,
@@ -95,7 +95,11 @@ async def read_card(client: Any, group: str, account: str) -> str:
         for key, expected in (("group_id", group), ("user_id", account))
     ):
         raise ApiFailure("回读的群或账号与当前目标不一致。")
-    return member["card"]
+    return member
+
+
+async def read_card(client: Any, group: str, account: str) -> str:
+    return (await read_member(client, group, account))["card"]
 
 
 @dataclass(frozen=True)

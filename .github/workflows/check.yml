@@ -1,5 +1,8 @@
 name: Checks
-on: [push, pull_request]
+# Keep checks available for an explicitly authorized manual run.
+# Publication must not start CI automatically.
+on:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
