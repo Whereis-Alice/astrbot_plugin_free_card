@@ -107,13 +107,14 @@ class UpdateResult:
     accepted: bool
     verified: bool = False
     detail: str = ""
+    unchanged: bool = False
 
 
 async def update_card(client: Any, group: str, account: str, name: str) -> UpdateResult:
     # Skip an unnecessary write only after a fresh check, never from local cache.
     try:
         if await read_card(client, group, account) == name:
-            return UpdateResult(True, True)
+            return UpdateResult(True, True, unchanged=True)
     except Exception as exc:  # noqa: BLE001 - OneBot wrappers use different exception classes.
         log.debug("Initial card read unavailable: %s", type(exc).__name__)
     accepted = False

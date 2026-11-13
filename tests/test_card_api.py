@@ -36,7 +36,8 @@ def test_success_is_verified_and_correct_account_is_routed():
 
 def test_current_card_does_not_write():
     client = SimpleNamespace(call_action=AsyncMock(return_value=member("new")))
-    assert asyncio.run(update_card(client, "123", "456", "new")).verified
+    result = asyncio.run(update_card(client, "123", "456", "new"))
+    assert result.verified and result.unchanged
     assert client.call_action.await_count == 1
 
 

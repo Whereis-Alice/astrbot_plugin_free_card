@@ -1,5 +1,6 @@
 """Exercise the real SDK runner's first tool request and restored follow-up."""
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -25,7 +26,10 @@ def test_real_runner_calls_card_then_receives_restored_tools(monkeypatch):
     update = AsyncMock(return_value=UpdateResult(True, True))
     monkeypatch.setattr("free_card_plugin.main.update_card", update)
     other = FunctionTool(name="lookup_weather", description="weather", parameters={})
-    request = ProviderRequest(prompt="normal chat", func_tool=ToolSet([other, plugin._tool]))
+    history = [{"role": "user", "content": "existing conversation memory"},
+               {"role": "assistant", "content": "previous reply"}]
+    request = ProviderRequest(prompt="normal chat", system_prompt="existing persona and memory",
+                              contexts=history, func_tool=ToolSet([other, plugin._tool]))
     observed = []
 
     class Provider:
@@ -38,6 +42,11 @@ def test_real_runner_calls_card_then_receives_restored_tools(monkeypatch):
             return "offline"
 
         async def text_chat(self, **kwargs):
+            contexts = json.dumps(kwargs.get("contexts", []), ensure_ascii=False,
+                                  default=lambda item: item.model_dump())
+            assert "existing conversation memory" in contexts and "previous reply" in contexts
+            assert "existing persona and memory" in contexts
+            assert ("[FreeCard reminder]" in contexts) is (len(observed) == 0)
             observed.append((kwargs["func_tool"].names(),
                              any("[FreeCard reminder]" in p.text
                                  for p in kwargs.get("extra_user_content_parts", []))))
@@ -55,6 +64,7 @@ def test_real_runner_calls_card_then_receives_restored_tools(monkeypatch):
 
     async def scenario():
         await plugin.remind(event, request)
+        assert request.contexts == history and request.system_prompt == "existing persona and memory"
         runner = ToolLoopAgentRunner()
         await runner.reset(provider=Provider(), request=request,
                            run_context=ContextWrapper(context=SimpleNamespace(event=event)),

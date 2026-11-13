@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,6 +32,8 @@ TOOL_NAME = "set_free_group_card"
 # AstrBot runs larger priorities first. My World's final reply gate is -1_000_000;
 # requests it suppresses must not consume this plugin's reminder interval.
 REMINDER_HOOK_PRIORITY = -1_000_001
+PREPARED_REMINDER_TIMEOUT = 120
+RUNNING_REMINDER_TIMEOUT = 3600
 DEFAULT_REMINDER = (
     "现在到了你自主调整 QQ 群名片的时间。请先调用 set_free_group_card，"
     "为自己自由决定一个简短的名字、心情或状态，按当前命名规则把文本传给 card。"
@@ -74,10 +77,18 @@ class Reminder:
     event: Any
     request: Any
     part: TextPart
+    key: tuple[str, str, str]
     created_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
+    run_task: asyncio.Task | None = None
     run_context: Any = None
     original_tools: Any = None
     gated_tools: Any = None
+
+
+def duration_text(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, math.ceil(seconds)), 60)
+    return f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
 
 
 def reminder_schema_mode(context: Any, event: Any) -> str:
@@ -191,12 +202,38 @@ class FreeCardPlugin(WorldCardMixin, Star):
         state.seen_at = now
         return state
 
-    def _notice_reminder_skip(self, state: GroupState, group: str, reason: str) -> None:
+    def _notice_reminder_skip(
+        self, state: GroupState, group: str, reason: str, detail: str,
+    ) -> None:
         now = time.monotonic()
-        if reason != state.last_skip_reason or now - state.skip_noticed_at >= 600:
-            logger.info("[free_card] reminder skipped group=%s reason=%s", group, reason)
+        if reason != state.last_skip_reason or now - state.skip_noticed_at >= 60:
+            logger.info("[随心名片] 群 %s：暂不提醒改名；%s", group, detail)
             state.last_skip_reason = reason
             state.skip_noticed_at = now
+
+    def _release_abandoned_reminders(self, now: float) -> None:
+        for reminder in list(self._reminders.values()):
+            task_finished = reminder.run_task is not None and reminder.run_task.done()
+            timeout = (PREPARED_REMINDER_TIMEOUT if reminder.started_at is None
+                       else RUNNING_REMINDER_TIMEOUT)
+            if not task_finished and now - reminder.created_at < timeout:
+                continue
+            if reminder.started_at is None:
+                logger.info(
+                    "[随心名片] 群 %s：已清理未开始的旧提醒（等待 %s）；"
+                    "这次准备不计入提醒间隔，下一次合格请求仍可提醒。",
+                    reminder.key[2], duration_text(now - reminder.created_at),
+                )
+            elif task_finished:
+                logger.warning(
+                    "[随心名片] 群 %s：上次模型任务已结束，但没有完成改名流程；"
+                    "已清理旧提醒并恢复工具，提醒间隔仍按实际开始时刻计算。",
+                    reminder.key[2],
+                )
+            else:
+                logger.warning("[随心名片] 群 %s：改名请求长时间未结束，已解除旧工具限制。",
+                               reminder.key[2])
+            self._cleanup(reminder)
 
     @filter.on_llm_request(priority=REMINDER_HOOK_PRIORITY)
     async def remind(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -207,10 +244,9 @@ class FreeCardPlugin(WorldCardMixin, Star):
         if callable(stopped) and stopped():
             return
         naming_rule = self._configure_tool()
-        # Release abandoned requests; cleanup matches our exact content only.
-        for reminder in list(self._reminders.values()):
-            if time.monotonic() - reminder.created_at > 3600:
-                self._cleanup(reminder)
+        # Preparation can be cancelled before an Agent starts. It must not
+        # consume the interval or retain a tool gate until the next hour.
+        self._release_abandoned_reminders(time.monotonic())
         target = self._target(event)
         interval = setting_int(self.config, "reminder_interval_minutes", 30, 10080) * 60
         if target is None or interval == 0:
@@ -218,25 +254,45 @@ class FreeCardPlugin(WorldCardMixin, Star):
         _, group, account = target
         state = self._state(event, group, account)
         try:
-            if await self._world_presence(event):
-                self._notice_reminder_skip(state, group, "world_visit_active")
+            if presence := await self._world_presence(event):
+                self._notice_reminder_skip(
+                    state, group, "world_visit_active",
+                    f"小世界已确认“{presence['status']}”，正在显示临时名片；归家后恢复日常提醒。",
+                )
                 return  # Presence is automatically maintained; preserve ordinary chat rhythm.
         except Exception as exc:  # noqa: BLE001 - World startup must not interrupt normal chat.
-            self._notice_reminder_skip(state, group, "world_not_ready:" + type(exc).__name__)
+            self._notice_reminder_skip(state, group, "world_not_ready",
+                                       f"小世界状态暂不可用（{type(exc).__name__}），稍后再检查。")
             return
         tools = getattr(req.func_tool, "tools", [])
         card_tool = next((tool for tool in tools
                           if tool.name == TOOL_NAME and getattr(tool, "active", True)), None)
         if card_tool is None:
-            self._notice_reminder_skip(state, group, "tool_unavailable")
+            self._notice_reminder_skip(
+                state, group, "tool_unavailable",
+                "本轮没有可用的 set_free_group_card 工具；请检查人格工具设置，"
+                "小世界自主请求还需开启主动工具并加入允许工具名单；只读请求不会改名。",
+            )
             return
         now = time.monotonic()
-        if now < state.write_after or (
-            state.reminded_at is not None and now - state.reminded_at < interval
-        ):
+        if now < state.write_after:
+            self._notice_reminder_skip(state, group, "write_cooldown",
+                                       f"改名冷却尚未结束，剩余 {duration_text(state.write_after - now)}。")
             return
-        # One event may create several provider requests; never stack reminders.
-        if id(event) in self._reminders:
+        if state.reminded_at is not None and now - state.reminded_at < interval:
+            self._notice_reminder_skip(
+                state, group, "interval",
+                f"提醒间隔设为 {duration_text(interval)}，距上次实际提醒或成功改名"
+                f"已过 {duration_text(now - state.reminded_at)}，"
+                f"还需 {duration_text(interval - (now - state.reminded_at))}。",
+            )
+            return
+        key = (event.get_platform_id(), account, group)
+        # Several native or proactive requests can be prepared for one group.
+        pending = next((r for r in self._reminders.values() if r.key == key), None)
+        if pending is not None:
+            stage = "模型正在处理上一次改名提醒" if pending.started_at is not None else "上一次提醒正在等待模型开始"
+            self._notice_reminder_skip(state, group, "pending", f"{stage}，已等 {duration_text(now - pending.created_at)}。")
             return
         text = self.config.get("reminder_text", DEFAULT_REMINDER)
         if not isinstance(text, str) or not text.strip():
@@ -252,13 +308,17 @@ class FreeCardPlugin(WorldCardMixin, Star):
             gated = ToolSet([card_tool])
             req.func_tool = gated
         req.extra_user_content_parts.append(part)
-        self._reminders[id(event)] = Reminder(event=event, request=req, part=part,
+        self._reminders[id(event)] = Reminder(event=event, request=req, part=part, key=key, created_at=now,
                                              original_tools=original if gated else None,
                                              gated_tools=gated)
-        state.reminded_at = now
         state.last_skip_reason = ""
-        logger.info("[free_card] reminder injected group=%s account=%s tools=%s->%s",
-                    group, account, len(tools), len(req.func_tool.tools))
+        elapsed = ("首次提醒" if state.reminded_at is None
+                   else f"距上次实际提醒或成功改名已过 {duration_text(now - state.reminded_at)}")
+        logger.info(
+            "[随心名片] 群 %s / 机器人 %s：已准备改名提醒（%s；间隔 %s）；"
+            "等待模型开始，本次准备尚不计时；首轮工具 %s→%s。",
+            group, account, elapsed, duration_text(interval), len(tools), len(req.func_tool.tools),
+        )
 
     @filter.on_agent_begin()
     async def bind_reminder(
@@ -268,7 +328,15 @@ class FreeCardPlugin(WorldCardMixin, Star):
     ) -> None:
         if reminder := self._reminders.get(id(event)):
             reminder.run_context = run_context
-            logger.info("[free_card] reminder reached agent group=%s", event.get_group_id())
+            if reminder.started_at is None:
+                reminder.started_at = time.monotonic()
+                reminder.run_task = asyncio.current_task()
+                self._state(event, reminder.key[2], reminder.key[1]).reminded_at = reminder.started_at
+                logger.info(
+                    "[随心名片] 群 %s：模型已开始处理改名提醒，从现在计时；"
+                    "要求先调用改名工具，名字由 bot 根据本轮已有上下文自由决定。",
+                    reminder.key[2],
+                )
 
     def _cleanup(self, reminder: Reminder) -> None:
         current = getattr(reminder.request, "func_tool", None)
@@ -282,7 +350,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
             )
         ):
             reminder.request.func_tool = reminder.original_tools
-            logger.info("[free_card] restored follow-up tools group=%s tools=%s->%s",
+            logger.info("[随心名片] 群 %s：已恢复后续工具 %s→%s，可继续原来的回复或任务。",
                         reminder.event.get_group_id(), len(gated.tools),
                         len(reminder.original_tools.tools))
         parts = reminder.request.extra_user_content_parts
@@ -316,7 +384,8 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 ]
                 if before and not content:
                     messages.remove(message)
-        self._reminders.pop(id(reminder.event), None)
+        if self._reminders.get(id(reminder.event)) is reminder:
+            self._reminders.pop(id(reminder.event), None)
 
     @filter.on_agent_done()
     async def finish_reminder(
@@ -327,9 +396,14 @@ class FreeCardPlugin(WorldCardMixin, Star):
     ) -> None:
         if reminder := self._reminders.get(id(event)):
             reminder.run_context = run_context
-            logger.info(
-                "[free_card] reminder finished without rename group=%s", event.get_group_id()
-            )
+            if reminder.started_at is None:
+                logger.info("[随心名片] 群 %s：请求在模型开始前结束，未执行改名；不计入提醒间隔。",
+                            reminder.key[2])
+            else:
+                logger.warning(
+                    "[随心名片] 群 %s：模型本轮结束，但没有调用改名工具；名片未由本轮修改。"
+                    "达到提醒间隔后，会在下一次合格请求中再次提醒。", reminder.key[2],
+                )
             self._cleanup(reminder)
 
     @tracked_write
@@ -337,14 +411,17 @@ class FreeCardPlugin(WorldCardMixin, Star):
         if self._closed:
             return "无法修改：插件已卸载。"
         if reminder := self._reminders.get(id(event)):
-            logger.info("[free_card] reminder reached tool group=%s", event.get_group_id())
+            logger.info("[随心名片] 群 %s：bot 已响应定期提醒并调用改名工具。", event.get_group_id())
             self._cleanup(reminder)
+        else:
+            logger.info("[随心名片] 群 %s：bot 调用了改名工具（本轮未附定期提醒）。", event.get_group_id())
         target = self._target(event)
         if target is None:
             return "无法修改：仅支持 OneBot v11 接入的 QQ 群聊；QQ 官方机器人不开放群名片修改接口。"
         try:
             name = compose_card(card, self.config.get("base_name", ""))
         except ValueError as exc:
+            logger.warning("[随心名片] 群 %s：改名文本无效，未提交 QQ：%s", event.get_group_id(), exc)
             return f"无法修改：{exc}"
         client, group, account = target
         world_row = await self._track_world_target(event, target)
@@ -354,12 +431,16 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 return "无法修改：插件已卸载。"
             now = time.monotonic()
             if now < state.write_after:
+                logger.info("[随心名片] 群 %s：改名工具暂缓执行，冷却剩余 %s。",
+                            group, duration_text(state.write_after - now))
                 return f"请保留当前名片，约 {int(state.write_after - now) + 1} 秒后可再修改。"
             try:
                 presence = await self._world_presence(event)
             except Exception as exc:  # noqa: BLE001 - Preserve a pending temporary name while its owner reloads.
                 self._world_log("World presence is not ready", exc)
                 return "小世界正在恢复状态，暂时保留当前名片，稍后再试。"
+            logger.info("[随心名片] 群 %s / 机器人 %s：bot 选择名片“%s”，开始核对并提交 QQ。",
+                        group, account, name)
             has_slots = bool(world_row.get("confirmed_slot") or world_row.get("pending_slot"))
             member = None
             owned = None
@@ -412,11 +493,17 @@ class FreeCardPlugin(WorldCardMixin, Star):
             if result.accepted:
                 state.reminded_at = completed_at
             if result.verified:
+                outcome = ("名片已是所选内容，无需重复写入：" if result.unchanged
+                           else "改名成功，当前名片为")
+                logger.info("[随心名片] 群 %s / 机器人 %s：%s“%s”；QQ 回读已确认。",
+                            group, account, outcome, name)
                 return f"群名片已确认是“{name}”。"
             if result.accepted:
+                logger.warning("[随心名片] 群 %s：QQ 接口已接受名片“%s”，但尚未回读确认；%s",
+                               group, name, result.detail)
                 return f"接口已接受“{name}”，暂时无法回读确认。请不要立即重复调用。{result.detail}"
             logger.warning(
-                "[free_card] set_group_card failed group=%s detail=%s", group, result.detail
+                "[随心名片] 群 %s：改名失败，已暂停尝试 5 分钟；%s", group, result.detail
             )
             return f"修改失败，已暂停尝试 300 秒：{result.detail}"
 

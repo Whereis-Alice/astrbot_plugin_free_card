@@ -161,6 +161,7 @@ def test_elapsed_interval_reminds_again():
     plugin, event = make_plugin(), Event()
     req = request(plugin)
     asyncio.run(plugin.remind(event, req))
+    asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
     asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
     plugin._state(event, "123", "456").reminded_at -= 1801
     next_req = request(plugin)
@@ -216,9 +217,103 @@ def test_reminder_lifecycle_logs_without_logging_prompt(caplog):
         asyncio.run(plugin.remind(event, req))
         asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
         asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
-    for label in ("reminder injected", "reminder reached agent", "reminder finished without rename"):
+    for label in ("已准备改名提醒", "模型已开始处理改名提醒", "没有调用改名工具"):
         assert label in caplog.text
     assert req.prompt not in caplog.text and DEFAULT_REMINDER not in caplog.text
+
+
+def test_preparation_does_not_reset_interval_and_canceled_request_is_released(monkeypatch, caplog):
+    clock = [1700.0]
+    monkeypatch.setattr("free_card_plugin.main.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    plugin, event = make_plugin({"reminder_interval_minutes": 10}), Event()
+    state = plugin._state(event, "123", "456")
+    state.reminded_at = 1000.0
+    req = request(plugin)
+    original = req.func_tool
+    asyncio.run(plugin.remind(event, req))
+    assert state.reminded_at == 1000.0
+    clock[0] += 121
+    next_req = request(plugin)
+    with caplog.at_level("INFO", logger="astrbot"):
+        asyncio.run(plugin.remind(Event(), next_req))
+    assert len(next_req.extra_user_content_parts) == 1
+    assert not req.extra_user_content_parts and req.func_tool is original
+    assert state.reminded_at == 1000.0 and "未开始的旧提醒" in caplog.text
+
+
+def test_interval_starts_once_when_agent_begins(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("free_card_plugin.main.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    plugin, event = make_plugin({"reminder_interval_minutes": 10}), Event()
+    req = request(plugin)
+    asyncio.run(plugin.remind(event, req))
+    assert plugin._state(event, "123", "456").reminded_at is None
+    clock[0] = 1100.0
+    asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
+    clock[0] = 1150.0
+    asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
+    assert plugin._state(event, "123", "456").reminded_at == 1100.0
+    asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    clock[0] = 1699.0
+    early = request(plugin)
+    asyncio.run(plugin.remind(Event(), early))
+    assert not early.extra_user_content_parts
+    clock[0] = 1700.0
+    due = request(plugin)
+    asyncio.run(plugin.remind(Event(), due))
+    assert len(due.extra_user_content_parts) == 1
+
+
+def test_closed_preparation_does_not_postpone_next_real_request(caplog):
+    plugin, event = make_plugin(), Event()
+    req = request(plugin)
+    asyncio.run(plugin.remind(event, req))
+    with caplog.at_level("INFO", logger="astrbot"):
+        asyncio.run(plugin.finish_reminder(event, None, None))
+    assert plugin._state(event, "123", "456").reminded_at is None
+    assert "模型开始前结束" in caplog.text and "没有调用改名工具" not in caplog.text
+    next_req = request(plugin)
+    asyncio.run(plugin.remind(Event(), next_req))
+    assert len(next_req.extra_user_content_parts) == 1
+
+
+def test_failed_agent_task_without_done_hook_does_not_block_next_due_reminder(monkeypatch, caplog):
+    clock = [1000.0]
+    monkeypatch.setattr("free_card_plugin.main.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    plugin, event = make_plugin({"reminder_interval_minutes": 10}), Event()
+    req = request(plugin)
+    original = req.func_tool
+    asyncio.run(plugin.remind(event, req))
+    # The owning task terminates without the AgentDone hook, as on a provider error.
+    asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
+    clock[0] = 1600.0
+    next_req = request(plugin)
+    with caplog.at_level("WARNING", logger="astrbot"):
+        asyncio.run(plugin.remind(Event(), next_req))
+    assert len(next_req.extra_user_content_parts) == 1
+    assert req.func_tool is original and not req.extra_user_content_parts
+    assert "上次模型任务已结束" in caplog.text
+
+
+def test_skip_log_explains_remaining_time_and_is_rate_limited(caplog):
+    plugin, event = make_plugin({"reminder_interval_minutes": 10}), Event()
+    state = plugin._state(event, "123", "456")
+    state.reminded_at = time.monotonic() - 300
+    with caplog.at_level("INFO", logger="astrbot"):
+        for _ in range(2):
+            asyncio.run(plugin.remind(event, request(plugin)))
+    assert caplog.text.count("暂不提醒改名") == 1
+    assert "提醒间隔设为 10 分 0 秒" in caplog.text and "还需" in caplog.text
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+def test_success_log_reports_actual_name_and_distinguishes_unchanged(monkeypatch, caplog, unchanged):
+    monkeypatch.setattr("free_card_plugin.main.update_card",
+                        AsyncMock(return_value=UpdateResult(True, True, unchanged=unchanged)))
+    with caplog.at_level("INFO", logger="astrbot"):
+        asyncio.run(make_plugin().rename(Event(), "Alice Tea"))
+    assert "Alice Tea" in caplog.text and "QQ 回读已确认" in caplog.text
+    assert ("无需重复写入" if unchanged else "改名成功") in caplog.text
 
 
 @pytest.mark.parametrize("mode", ["missing", "inactive", "disabled", "official", "private"])
