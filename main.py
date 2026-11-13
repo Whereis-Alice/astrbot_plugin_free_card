@@ -300,7 +300,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 member = await read_member(client, group, account)
                 owned = resolve_slot(world_row, member["card"])
             if presence or has_slots:
-                slot = {"baseline": name, "card": name, "restore": True}
+                slot = {"baseline": name, "card": name, "restore": True, "explicit_baseline": True}
                 if presence:
                     if member is None:
                         member = await read_member(client, group, account)
@@ -308,10 +308,18 @@ class FreeCardPlugin(WorldCardMixin, Star):
                     if display is None:
                         return "无法确定串门名片的显示名字，请设置基础名字或检查机器人昵称。"
                     slot = presence_slot(name, presence, display)
+                    slot["explicit_baseline"] = True
                     if owned is not None and member["card"] == slot["card"]:
+                        previous = dict(world_row)
                         world_row["confirmed_slot"] = slot
                         world_row.pop("pending_slot", None)
-                        await self._save_world_records()
+                        world_row["legacy_world_checked"] = True
+                        try:
+                            await self._save_world_records()
+                        except BaseException:
+                            world_row.clear()
+                            world_row.update(previous)
+                            raise
                         return (f"正常名片已保存为“{name}”；串门期间继续显示“{slot['card']}”，"
                                 "归家后恢复刚保存的名字。")
                 name = slot["card"]
@@ -319,16 +327,11 @@ class FreeCardPlugin(WorldCardMixin, Star):
                                                       updater=update_card)
                 completed_at = time.monotonic()
             else:
-                # Reserve before awaiting: cancellation must not cause a write burst.
-                interval = setting_int(self.config, "min_update_seconds", 60, 3600)
-                state.write_after = now + max(5, interval)
-                try:
-                    result = await update_card(client, group, account, name)
-                except asyncio.CancelledError:
-                    state.write_after = time.monotonic() + 300
-                    raise
+                # Retain explicit intent without claiming an unconfirmed write succeeded.
+                slot = {"baseline": name, "card": name, "restore": True, "explicit_baseline": True}
+                result = await self._write_world_slot(client, group, account, world_row, state, slot,
+                                                      updater=update_card)
                 completed_at = time.monotonic()
-                state.write_after = completed_at + (interval if result.accepted else 300)
             if result.accepted:
                 state.reminded_at = completed_at
             if result.verified:
