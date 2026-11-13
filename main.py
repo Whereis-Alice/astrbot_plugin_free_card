@@ -19,6 +19,7 @@ from pydantic.dataclasses import dataclass as tool_dataclass
 
 from .card_api import compose_card, read_member, update_card, validate_card
 from .world_card import (
+    LEGACY_CHECK_VERSION,
     WorldCardMixin,
     presence_display_base,
     presence_slot,
@@ -313,7 +314,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
                         previous = dict(world_row)
                         world_row["confirmed_slot"] = slot
                         world_row.pop("pending_slot", None)
-                        world_row["legacy_world_checked"] = True
+                        world_row["legacy_world_checked"] = LEGACY_CHECK_VERSION
                         try:
                             await self._save_world_records()
                         except BaseException:

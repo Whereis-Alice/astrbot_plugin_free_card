@@ -1,7 +1,7 @@
 name: astrbot_plugin_free_card
 display_name: 随心名片
 desc: 提醒 bot 按聊天和人格自由决定自己的 QQ 群名片，仅提供一个改名工具。
-version: v1.2.2
+version: v1.2.3
 author: Huli3
 repo: https://github.com/Whereis-Alice/astrbot_plugin_free_card
 astrbot_version: ">=4.25,<5"

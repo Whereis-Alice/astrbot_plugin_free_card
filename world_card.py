@@ -14,6 +14,7 @@ from .card_api import read_member, update_card, validate_card
 WORLD_PLUGIN = "astrbot_plugin_my_world"
 WORLD_RECORDS_KEY = "world_card_records_v2"
 LEGACY_WORLD_RECORDS_KEY = "world_card_records_v1"
+LEGACY_CHECK_VERSION = 2
 MAX_TARGETS = 1024
 SLOT_KEYS = ("confirmed_slot", "pending_slot")
 RENDER_VERSION = 2
@@ -72,7 +73,7 @@ def resolve_slot(row: dict[str, Any], current: str) -> dict[str, Any] | None:
     pending = row.get("pending_slot")
     if isinstance(pending, dict) and pending.get("card") == current:
         if pending.get("explicit_baseline"):
-            row["legacy_world_checked"] = True
+            row["legacy_world_checked"] = LEGACY_CHECK_VERSION
         if pending.get("restore"):
             for key in SLOT_KEYS:
                 row.pop(key, None)
@@ -83,7 +84,7 @@ def resolve_slot(row: dict[str, Any], current: str) -> dict[str, Any] | None:
     confirmed = row.get("confirmed_slot")
     if isinstance(confirmed, dict) and confirmed.get("card") == current:
         if confirmed.get("explicit_baseline"):
-            row["legacy_world_checked"] = True
+            row["legacy_world_checked"] = LEGACY_CHECK_VERSION
         row.pop("pending_slot", None)
         return confirmed
     for key in SLOT_KEYS:
@@ -296,7 +297,8 @@ class WorldCardMixin:
             confirmed = row.get("confirmed_slot") or {}
             display = (presence_display_base(self.config, presence,
                        baseline=confirmed.get("baseline", ""), saved=confirmed) if presence else None)
-            if (row.get("legacy_world_checked") and presence and not row.get("pending_slot")
+            if (row.get("legacy_world_checked") == LEGACY_CHECK_VERSION
+                    and presence and not row.get("pending_slot")
                     and confirmed.get("token") == presence["token"]
                     and confirmed.get("status") == presence["status"]
                     and confirmed.get("render_version") == RENDER_VERSION
@@ -304,17 +306,17 @@ class WorldCardMixin:
                     and confirmed.get("display_base") == display[0]
                     and confirmed.get("display_source") == display[1]):
                 return True
-            if (row.get("legacy_world_checked") and not presence
+            if (row.get("legacy_world_checked") == LEGACY_CHECK_VERSION and not presence
                     and not any(row.get(key) for key in SLOT_KEYS)):
                 return False
             member = await read_member(client, group, account)
             current = member["card"]
             owned = resolve_slot(row, current)
             baseline = owned["baseline"] if owned is not None else current
-            if not row.get("legacy_world_checked"):
+            if row.get("legacy_world_checked") != LEGACY_CHECK_VERSION:
                 clean = await self._world_baseline(event, baseline)
                 # A failing helper leaves this unset so the next bounded check retries.
-                row["legacy_world_checked"] = True
+                row["legacy_world_checked"] = LEGACY_CHECK_VERSION
                 if clean is not None:
                     baseline = clean
                     if owned is not None:

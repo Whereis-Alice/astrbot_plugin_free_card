@@ -9,6 +9,7 @@ import pytest
 from free_card_plugin.card_api import UpdateResult
 from free_card_plugin.main import FreeCardPlugin
 from free_card_plugin.world_card import (
+    LEGACY_CHECK_VERSION,
     LEGACY_WORLD_RECORDS_KEY,
     WORLD_PLUGIN,
     WORLD_RECORDS_KEY,
@@ -566,6 +567,61 @@ def seed_unchecked_legacy_owned_card(plugin, event, *, baseline="Alice | 事件�
                            "token": "visit-a", "status": "拜访艾拉", "render_version": 2,
                            "display_base": "Alice", "display_source": "world"},
     }
+
+
+@pytest.mark.parametrize("active_visit", [False, True])
+def test_old_boolean_check_rechecks_newly_proven_visit_suffix_once(monkeypatch, active_visit):
+    async def scenario():
+        old, clean = "Alice 窝在被窝里 | 拜访艾拉", "Alice 窝在被窝里"
+        plugin, event, situation, updater = fixture(monkeypatch, card=old)
+        if active_visit:
+            seed_unchecked_legacy_owned_card(plugin, event, baseline=old)
+            situation["presence"]["name"] = "Alice"
+        else:
+            situation["presence"] = None
+            await plugin.remember_world_target(event)
+        row = plugin._world_records["qq:456:123"]
+        row["legacy_world_checked"] = True
+        situation["baseline_proofs"][old] = clean
+        helper = plugin.context.get_all_stars()[0].star_cls.get_group_card_baseline
+        assert await plugin.sync_world_group_card(event)
+        assert row["legacy_world_checked"] == LEGACY_CHECK_VERSION
+        if active_visit:
+            assert event.bot.card == "Alice 拜访艾拉"
+            assert row["confirmed_slot"]["baseline"] == clean
+            updater.assert_not_awaited()
+        else:
+            assert event.bot.card == clean
+        helper.assert_awaited_once_with(event.unified_msg_origin, old)
+        reads, writes = event.bot.read_count, updater.await_count
+        for _ in range(5):
+            await plugin.sync_world_group_card(event)
+        assert event.bot.read_count == reads and updater.await_count == writes
+        assert helper.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_old_boolean_check_preserves_confirmed_explicit_baseline(monkeypatch):
+    async def scenario():
+        chosen = "Alice | 拜访艾拉"
+        plugin, event, situation, updater = fixture(monkeypatch)
+        seed_unchecked_legacy_owned_card(plugin, event, baseline=chosen)
+        row = plugin._world_records["qq:456:123"]
+        row["legacy_world_checked"] = True
+        row["confirmed_slot"]["explicit_baseline"] = True
+        situation["presence"]["name"] = "Alice"
+        situation["baseline_proofs"][chosen] = "Alice"
+        helper = plugin.context.get_all_stars()[0].star_cls.get_group_card_baseline
+        assert await plugin.sync_world_group_card(event)
+        assert row["legacy_world_checked"] == LEGACY_CHECK_VERSION
+        assert row["confirmed_slot"]["baseline"] == chosen
+        helper.assert_not_awaited()
+        updater.assert_not_awaited()
+        situation["presence"] = None
+        assert await plugin.sync_world_group_card(event)
+        assert event.bot.card == chosen
+        helper.assert_not_awaited()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failure", ["rejected", "unverified", "canceled"])
