@@ -15,15 +15,42 @@ WORLD_PLUGIN = "astrbot_plugin_my_world"
 WORLD_RECORDS_KEY = "world_card_records_v1"
 MAX_TARGETS = 1024
 SLOT_KEYS = ("confirmed_slot", "pending_slot")
+RENDER_VERSION = 2
 
 
 def compose_presence(base: str, status: str) -> str:
     """Keep the chosen name intact and shorten only the temporary status."""
     base = validate_card(base)
-    suffix = " | " + " ".join(status.split())
+    suffix = " " + " ".join(status.split())
     while suffix and (len(base + suffix) > 32 or len((base + suffix).encode("utf-8")) > 60):
         suffix = suffix[:-1]
-    return validate_card(base + suffix) if len(suffix.strip()) > 1 else base
+    return validate_card(base + suffix) if suffix.strip() else base
+
+
+def presence_display_base(config: Any, presence: dict[str, str], *,
+                          member: dict[str, Any] | None = None, baseline: str = "",
+                          saved: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    """Select an identity independently of the full normal card kept for restoration."""
+    candidates = [(config.get("base_name", ""), "config"), (presence.get("name", ""), "world")]
+    if member is not None:
+        candidates.append((member.get("nickname", ""), "nickname"))
+    elif saved and saved.get("display_source") in {"nickname", "baseline"}:
+        candidates.append((saved.get("display_base", ""), saved["display_source"]))
+    candidates.append((baseline, "baseline"))
+    for candidate, source in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        try:
+            return validate_card(candidate), source
+        except ValueError:
+            continue
+    return None
+
+
+def presence_slot(baseline: str, presence: dict[str, str], display: tuple[str, str]) -> dict[str, Any]:
+    return {"card": compose_presence(display[0], presence["status"]), "baseline": baseline,
+            "token": presence["token"], "status": presence["status"],
+            "render_version": RENDER_VERSION, "display_base": display[0], "display_source": display[1]}
 
 
 def tracked_write(function):
@@ -154,8 +181,11 @@ class WorldCardMixin:
                 value = await value
             if (isinstance(value, dict) and value.get("source") == WORLD_PLUGIN
                     and isinstance(value.get("status"), str) and value["status"].strip()):
-                return {"status": " ".join(value["status"].split())[:40],
-                        "token": str(value.get("token") or "")}
+                result = {"status": " ".join(value["status"].split())[:40],
+                          "token": str(value.get("token") or "")}
+                if isinstance(value.get("name"), str) and value["name"].strip():
+                    result["name"] = value["name"]
+                return result
         return None
 
     def _world_recovered_event(self, key: str, row: dict[str, Any]) -> Any:
@@ -223,9 +253,15 @@ class WorldCardMixin:
                 return False
             presence = await self._world_presence(event, current_event=False)
             confirmed = row.get("confirmed_slot") or {}
+            display = (presence_display_base(self.config, presence,
+                       baseline=confirmed.get("baseline", ""), saved=confirmed) if presence else None)
             if (presence and not row.get("pending_slot")
                     and confirmed.get("token") == presence["token"]
-                    and confirmed.get("status") == presence["status"]):
+                    and confirmed.get("status") == presence["status"]
+                    and confirmed.get("render_version") == RENDER_VERSION
+                    and display is not None
+                    and confirmed.get("display_base") == display[0]
+                    and confirmed.get("display_source") == display[1]):
                 return True
             if not presence and not any(row.get(key) for key in SLOT_KEYS):
                 return False
@@ -239,13 +275,11 @@ class WorldCardMixin:
                 slot = {"card": owned["baseline"], "baseline": owned["baseline"], "restore": True}
             else:
                 baseline = owned["baseline"] if owned is not None else current
-                display = (baseline or str(self.config.get("base_name") or "").strip()
-                           or str(member.get("nickname") or "").strip())
+                display = presence_display_base(self.config, presence, member=member, baseline=baseline)
                 if not display:
                     await self._save_world_records()
                     return False
-                slot = {"card": compose_presence(display, presence["status"]), "baseline": baseline,
-                        "token": presence["token"], "status": presence["status"]}
+                slot = presence_slot(baseline, presence, display)
             result = await self._write_world_slot(client, group, account, row, state, slot)
             return result.verified
 

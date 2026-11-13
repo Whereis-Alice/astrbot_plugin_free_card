@@ -18,7 +18,13 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass as tool_dataclass
 
 from .card_api import compose_card, read_member, update_card, validate_card
-from .world_card import WorldCardMixin, compose_presence, resolve_slot, tracked_write
+from .world_card import (
+    WorldCardMixin,
+    presence_display_base,
+    presence_slot,
+    resolve_slot,
+    tracked_write,
+)
 
 TOOL_NAME = "set_free_group_card"
 DEFAULT_REMINDER = (
@@ -288,14 +294,26 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 self._world_log("World presence is not ready", exc)
                 return "小世界正在恢复状态，暂时保留当前名片，稍后再试。"
             has_slots = bool(world_row.get("confirmed_slot") or world_row.get("pending_slot"))
+            member = None
+            owned = None
             if has_slots:
                 member = await read_member(client, group, account)
-                resolve_slot(world_row, member["card"])
+                owned = resolve_slot(world_row, member["card"])
             if presence or has_slots:
                 slot = {"baseline": name, "card": name, "restore": True}
                 if presence:
-                    slot = {"baseline": name, "card": compose_presence(name, presence["status"]),
-                            "token": presence["token"], "status": presence["status"]}
+                    if member is None:
+                        member = await read_member(client, group, account)
+                    display = presence_display_base(self.config, presence, member=member, baseline=name)
+                    if display is None:
+                        return "无法确定串门名片的显示名字，请设置基础名字或检查机器人昵称。"
+                    slot = presence_slot(name, presence, display)
+                    if owned is not None and member["card"] == slot["card"]:
+                        world_row["confirmed_slot"] = slot
+                        world_row.pop("pending_slot", None)
+                        await self._save_world_records()
+                        return (f"正常名片已保存为“{name}”；串门期间继续显示“{slot['card']}”，"
+                                "归家后恢复刚保存的名字。")
                 name = slot["card"]
                 result = await self._write_world_slot(client, group, account, world_row, state, slot,
                                                       updater=update_card)

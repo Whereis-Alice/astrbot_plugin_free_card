@@ -14,9 +14,11 @@ from free_card_plugin.world_card import WORLD_PLUGIN, compose_presence
 class Client:
     def __init__(self, card="Alice", nickname="Alice"):
         self.card, self.nickname = card, nickname
+        self.read_count = 0
 
     async def call_action(self, action, **params):
         assert action == "get_group_member_info"
+        self.read_count += 1
         return {"card": self.card, "nickname": self.nickname,
                 "group_id": 123, "user_id": 456}
 
@@ -57,7 +59,7 @@ def test_empty_card_uses_nickname_and_restores_exact_empty_value(monkeypatch):
         plugin, event, situation, updater = fixture(monkeypatch, card="")
         await plugin.remember_world_target(event)  # Does not need an LLM request.
         assert await plugin.sync_world_group_card(event)
-        assert event.bot.card == "Alice | 拜访艾拉"
+        assert event.bot.card == "Alice 拜访艾拉"
         assert next(iter(plugin._world_records.values()))["confirmed_slot"]["baseline"] == ""
         situation["presence"] = None
         assert await plugin.sync_world_group_card(event)
@@ -81,15 +83,15 @@ def test_canceled_scene_change_preserves_both_possible_ownership_values(monkeypa
         with pytest.raises(asyncio.CancelledError):
             await plugin.sync_world_group_card(event)
         row = next(iter(plugin._world_records.values()))
-        assert row["confirmed_slot"]["card"] == "Alice | 拜访艾拉"
-        assert row["pending_slot"]["card"] == "Alice | 拜访莉耶芙"
+        assert row["confirmed_slot"]["card"] == "Alice 拜访艾拉"
+        assert row["pending_slot"]["card"] == "Alice 拜访莉耶芙"
         async def apply(bot, _group, _account, name):
             bot.card = name
             return UpdateResult(True, True)
         updater.side_effect = apply
         free_clock(plugin, event)
         await plugin.sync_world_group_card(event)
-        assert event.bot.card == "Alice | 拜访莉耶芙"
+        assert event.bot.card == "Alice 拜访莉耶芙"
         assert row["confirmed_slot"]["baseline"] == "Alice"
         situation["presence"] = None
         await plugin.sync_world_group_card(event)
@@ -102,6 +104,7 @@ def test_canceled_new_name_restores_the_baseline_corresponding_to_actual_write(m
     async def scenario():
         plugin, event, situation, updater = fixture(monkeypatch)
         await plugin.sync_world_group_card(event)
+        situation["presence"]["name"] = "Changed visible identity"
         async def interrupted(bot, _group, _account, name):
             if applied:
                 bot.card = name
@@ -138,7 +141,7 @@ def test_failed_normal_rename_after_visit_does_not_discard_restoration(monkeypat
             updater.return_value = UpdateResult(failure == "accepted_unverified", False)
             await plugin.rename(event, "New Alice")
         row = next(iter(plugin._world_records.values()))
-        assert row["confirmed_slot"]["card"] == "Alice | 拜访艾拉"
+        assert row["confirmed_slot"]["card"] == "Alice 拜访艾拉"
         assert row["pending_slot"]["card"] == "New Alice"
         async def apply(bot, _group, _account, name):
             bot.card = name
@@ -168,13 +171,16 @@ def test_background_scope_uses_current_config_and_respects_external_new_name(mon
     asyncio.run(scenario())
 
 
-def test_tool_names_replace_baseline_and_do_not_stack_statuses(monkeypatch):
+def test_tool_names_save_new_baseline_without_changing_same_temporary_display(monkeypatch):
     async def scenario():
-        plugin, event, situation, _ = fixture(monkeypatch, config={"base_name": "Alice"})
+        plugin, event, situation, updater = fixture(monkeypatch, config={"base_name": "Alice"})
         await plugin.sync_world_group_card(event)
-        await plugin.rename(event, "喝茶中")
-        await plugin.rename(event, "看书中")
-        assert event.bot.card == "Alice 看书中 | 拜访艾拉"
+        first = await plugin.rename(event, "喝茶中")
+        second = await plugin.rename(event, "看书中")
+        assert "正常名片已保存" in first and "正常名片已保存" in second
+        assert event.bot.card == "Alice 拜访艾拉"
+        assert updater.await_count == 1
+        assert next(iter(plugin._world_records.values()))["confirmed_slot"]["baseline"] == "Alice 看书中"
         situation["presence"] = None
         await plugin.sync_world_group_card(event)
         assert event.bot.card == "Alice 看书中"
@@ -185,7 +191,7 @@ def test_current_scope_excluding_free_card_restores_and_stops_its_maintenance(mo
     async def scenario():
         plugin, event, situation, updater = fixture(monkeypatch)
         await plugin.sync_world_group_card(event)
-        assert event.bot.card == "Alice | 拜访艾拉"
+        assert event.bot.card == "Alice 拜访艾拉"
         situation["allowed"] = [WORLD_PLUGIN]
         await plugin.sync_world_group_card(event)
         assert event.bot.card == "Alice"
@@ -199,6 +205,7 @@ def test_reload_settles_canceled_inflight_writer_before_persisting_final_ledger(
     async def scenario():
         plugin, event, situation, updater = fixture(monkeypatch)
         await plugin.sync_world_group_card(event)
+        situation["presence"]["name"] = "Changed visible identity"
         entered = asyncio.Event()
         async def blocked(bot, _group, _account, name):
             bot.card = name  # QQ applied before the interrupted response.
@@ -239,6 +246,89 @@ def test_qq_length_limits_keep_base_intact():
         name = compose_presence(base, "拜访莉耶芙")
         assert name.startswith(base)
         assert len(name) <= 32 and len(name.encode("utf-8")) <= 60
+
+
+@pytest.mark.parametrize("config, identity", [
+    ({"base_name": "艾拉"}, "艾拉"),
+    ({"base_name": ""}, "艾拉"),
+    ({"base_name": "艾拉 | Aino"}, "艾拉 | Aino"),
+])
+def test_only_current_status_is_displayed_and_original_complete_card_is_restored(monkeypatch, config, identity):
+    async def scenario():
+        original = "艾拉 拒绝贴贴中 | 事件中"
+        plugin, event, situation, _ = fixture(monkeypatch, card=original, config=config)
+        situation["presence"].update(name="艾拉", status="接待爱丽丝")
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == identity + " 接待爱丽丝"
+        slot = next(iter(plugin._world_records.values()))["confirmed_slot"]
+        assert slot["baseline"] == original and slot["display_base"] == identity
+        assert slot["render_version"] == 2
+        situation["presence"] = None
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == original
+    asyncio.run(scenario())
+
+
+def test_deliberately_selected_pipe_in_normal_name_is_preserved_for_restoration(monkeypatch):
+    async def scenario():
+        original = "Alice | Wonderland"
+        plugin, event, situation, _ = fixture(monkeypatch, card=original)
+        situation["presence"]["name"] = "Alice"
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == "Alice 拜访艾拉"
+        assert next(iter(plugin._world_records.values()))["confirmed_slot"]["baseline"] == original
+        await plugin.rename(event, "Alice | Looking-glass")
+        situation["presence"] = None
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == "Alice | Looking-glass"
+    asyncio.run(scenario())
+
+
+def test_old_slot_is_redrawn_after_reload_even_with_same_visit_token(monkeypatch):
+    async def scenario():
+        baseline = "艾拉 拒绝贴贴中 | 事件中"
+        old_card = baseline + " | 接待爱丽丝"
+        plugin, event, situation, _ = fixture(monkeypatch, card=old_card)
+        situation["presence"].update(name="艾拉", status="接待爱丽丝")
+        plugin.get_kv_data.return_value = {"qq:456:123": {
+            "session": event.unified_msg_origin, "platform": "qq", "group": "123", "account": "456",
+            "confirmed_slot": {"card": old_card, "baseline": baseline,
+                               "token": "visit-a", "status": "接待爱丽丝"},
+        }}
+        await plugin.initialize()
+        try:
+            await asyncio.sleep(.01)
+            assert event.bot.card == "艾拉 接待爱丽丝"
+            row = next(iter(plugin._world_records.values()))
+            assert row["confirmed_slot"]["baseline"] == baseline
+            assert row["confirmed_slot"]["render_version"] == 2
+            situation["presence"] = None
+            await plugin.sync_world_group_card(event)
+            assert event.bot.card == baseline
+        finally:
+            await plugin.terminate()
+    asyncio.run(scenario())
+
+
+def test_stable_identity_uses_no_qq_reads_but_changed_identity_is_redrawn(monkeypatch):
+    async def scenario():
+        plugin, event, situation, updater = fixture(monkeypatch)
+        await plugin.sync_world_group_card(event)  # Nickname fallback is recorded once.
+        reads, writes = event.bot.read_count, updater.await_count
+        for _ in range(5):
+            await plugin.sync_world_group_card(event)
+        assert event.bot.read_count == reads and updater.await_count == writes
+        situation["presence"]["name"] = "World Alice"
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == "World Alice 拜访艾拉"
+        reads, writes = event.bot.read_count, updater.await_count
+        for _ in range(5):
+            await plugin.sync_world_group_card(event)
+        assert event.bot.read_count == reads and updater.await_count == writes
+        plugin.config["base_name"] = "Configured Alice"
+        await plugin.sync_world_group_card(event)
+        assert event.bot.card == "Configured Alice 拜访艾拉"
+    asyncio.run(scenario())
 
 
 def test_target_limit_does_not_evict_pending_restore_or_retain_full_events(monkeypatch):
