@@ -21,7 +21,13 @@ from astrbot.core.star.star_handler import (
 )
 
 from free_card_plugin.card_api import UpdateResult
-from free_card_plugin.main import DEFAULT_REMINDER, TOOL_NAME, FreeCardPlugin, FreeCardTool
+from free_card_plugin.main import (
+    DEFAULT_REMINDER,
+    REQUIRED_ACTION,
+    TOOL_NAME,
+    FreeCardPlugin,
+    FreeCardTool,
+)
 
 
 class Event:
@@ -68,7 +74,7 @@ def request(plugin):
     return ProviderRequest(prompt="hello", func_tool=ToolSet([unrelated, plugin._tool]))
 
 
-def test_first_request_reminded_once_and_other_tools_unchanged():
+def test_first_request_reminded_once_and_gates_only_its_own_toolset():
     plugin, event = make_plugin(), Event()
     req = request(plugin)
     parts, tools = req.extra_user_content_parts, req.func_tool
@@ -76,7 +82,71 @@ def test_first_request_reminded_once_and_other_tools_unchanged():
     asyncio.run(plugin.remind(event, req))
     assert len(parts) == 1 and parts[0]._no_save
     assert DEFAULT_REMINDER in parts[0].text
-    assert req.prompt == "hello" and req.func_tool is tools and len(tools.tools) == 2
+    assert req.prompt == "hello" and req.func_tool is not tools
+    assert req.func_tool.tools == [plugin._tool] and len(tools.tools) == 2
+    assert REQUIRED_ACTION in parts[0].text
+
+
+@pytest.mark.parametrize("outcome", ["invalid", "failed", "canceled", "successful"])
+def test_card_tool_restores_followup_tools_for_all_outcomes(monkeypatch, outcome):
+    plugin, event = make_plugin(), Event()
+    req = request(plugin)
+    original = req.func_tool
+    asyncio.run(plugin.remind(event, req))
+    write = AsyncMock(return_value=UpdateResult(outcome == "successful", outcome == "successful"))
+    if outcome == "canceled":
+        write.side_effect = asyncio.CancelledError()
+    monkeypatch.setattr("free_card_plugin.main.update_card", write)
+    if outcome == "canceled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(plugin.rename(event, "Alice New"))
+    else:
+        asyncio.run(plugin.rename(event, "" if outcome == "invalid" else "Alice New"))
+    assert req.func_tool is original and len(original.tools) == 2
+    assert not req.extra_user_content_parts and not plugin._reminders
+
+
+def test_proactive_guard_is_retained_and_cloned_gate_can_be_restored():
+    plugin, event = make_plugin(), Event()
+    guarded = FunctionTool(name=TOOL_NAME, description="guarded", parameters={})
+    other = FunctionTool(name="other", description="other", parameters={})
+    original = ToolSet([guarded, other])
+    req = ProviderRequest(prompt="hello", func_tool=original)
+    asyncio.run(plugin.remind(event, req))
+    assert req.func_tool.get_tool(TOOL_NAME) is guarded
+    req.func_tool = ToolSet(list(req.func_tool.tools))
+    asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    assert req.func_tool is original and req.func_tool.get_tool(TOOL_NAME) is guarded
+
+
+def test_cleanup_respects_permission_revocation_after_our_gate():
+    plugin, event = make_plugin(), Event()
+    req = request(plugin)
+    asyncio.run(plugin.remind(event, req))
+    revoked = ToolSet()
+    req.func_tool = revoked
+    asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    assert req.func_tool is revoked
+
+
+def test_skills_like_keeps_original_toolset_for_its_raw_executors():
+    plugin, event = make_plugin(), Event()
+    plugin.context.get_config = lambda _: {"agent_runner": {"config": {
+        "misc": {"tool_schema_mode": "skills_like"}}}}
+    req = request(plugin)
+    original = req.func_tool
+    asyncio.run(plugin.remind(event, req))
+    assert req.func_tool is original and REQUIRED_ACTION in req.extra_user_content_parts[0].text
+
+
+def test_shared_host_tools_and_other_request_are_never_globally_restricted():
+    plugin, event = make_plugin(), Event()
+    req = request(plugin)
+    shared = req.func_tool
+    other = ProviderRequest(prompt="other group", func_tool=shared)
+    asyncio.run(plugin.remind(event, req))
+    assert len(shared.tools) == 2 and other.func_tool is shared
+    assert all(t.active for t in shared.tools)
 
 
 def test_group_reminder_interval_applies_across_events():

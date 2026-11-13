@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from astrbot.api import AstrBotConfig, FunctionTool, logger
+from astrbot.api import AstrBotConfig, FunctionTool, ToolSet, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
@@ -32,16 +32,20 @@ TOOL_NAME = "set_free_group_card"
 # requests it suppresses must not consume this plugin's reminder interval.
 REMINDER_HOOK_PRIORITY = -1_000_001
 DEFAULT_REMINDER = (
-    "你可以根据当前聊天、心情和人格，为自己自由决定一个简短的 QQ 群名片。"
-    "想换名片时，请调用 set_free_group_card，按当前命名规则把文本传给 card。"
-    "也可以保留现在的名字，不必为了提醒而硬改。"
-    "内容由你决定，不必套用固定后缀。不要把这段提醒复述给群友，继续自然回应聊天。"
+    "现在到了你自主调整 QQ 群名片的时间。请先调用 set_free_group_card，"
+    "为自己自由决定一个简短的名字、心情或状态，按当前命名规则把文本传给 card。"
+    "内容由你决定，不必套用固定后缀，也不用等待群友要求改名。"
+    "工具返回后继续原来的回复或任务，不要把这段提醒复述给群友。"
+)
+REQUIRED_ACTION = (
+    "本轮请先实际调用 set_free_group_card 完成自主改名，再继续原来的回复或任务。"
+    "不要只在文字中声称已经改名，也不要等待用户再次要求；本轮不要重复调用。"
 )
 DEFAULT_TOOL_DESCRIPTION = (
     "自由修改你在当前 QQ 群中的完整群名片，表达你的名字、心情或当前状态。"
     "只修改自己。card 是最终显示的完整文本，不会自动拼接基础名字或后缀。"
     "内容保持简短，最多 32 个字符且不超过 60 个 UTF-8 字节。"
-    "想保留原名时无需调用；仅在确实想换名片时使用。"
+    "收到自主改名提醒时，请先调用此工具；平常也可以按自己的意愿使用。"
 )
 
 
@@ -72,6 +76,18 @@ class Reminder:
     part: TextPart
     created_at: float = field(default_factory=time.monotonic)
     run_context: Any = None
+    original_tools: Any = None
+    gated_tools: Any = None
+
+
+def reminder_schema_mode(context: Any, event: Any) -> str:
+    getter = getattr(context, "get_config", None)
+    if not callable(getter):
+        return "full"
+    config = getter(getattr(event, "unified_msg_origin", ""))
+    misc = config.get("agent_runner", {}).get("config", {}).get("misc", {})
+    return str(misc.get("tool_schema_mode") or
+               config.get("provider_settings", {}).get("tool_schema_mode", "full"))
 
 
 @tool_dataclass
@@ -209,7 +225,9 @@ class FreeCardPlugin(WorldCardMixin, Star):
             self._notice_reminder_skip(state, group, "world_not_ready:" + type(exc).__name__)
             return
         tools = getattr(req.func_tool, "tools", [])
-        if not any(tool.name == TOOL_NAME and getattr(tool, "active", True) for tool in tools):
+        card_tool = next((tool for tool in tools
+                          if tool.name == TOOL_NAME and getattr(tool, "active", True)), None)
+        if card_tool is None:
             self._notice_reminder_skip(state, group, "tool_unavailable")
             return
         now = time.monotonic()
@@ -224,13 +242,23 @@ class FreeCardPlugin(WorldCardMixin, Star):
         if not isinstance(text, str) or not text.strip():
             text = DEFAULT_REMINDER
         part = TextPart(
-            text=f"[FreeCard reminder]\n{text.strip()[:2000]}\n当前命名规则：{naming_rule}"
+            text=f"[FreeCard reminder]\n{text.strip()[:2000]}\n{REQUIRED_ACTION}\n当前命名规则：{naming_rule}"
         ).mark_as_temp()
+        # Keep the selected permission proxy, including My World's guarded tool.
+        # Replacing this request never changes global tool activation.
+        original = req.func_tool
+        gated = None
+        if reminder_schema_mode(self.context, event) != "skills_like":
+            gated = ToolSet([card_tool])
+            req.func_tool = gated
         req.extra_user_content_parts.append(part)
-        self._reminders[id(event)] = Reminder(event=event, request=req, part=part)
+        self._reminders[id(event)] = Reminder(event=event, request=req, part=part,
+                                             original_tools=original if gated else None,
+                                             gated_tools=gated)
         state.reminded_at = now
         state.last_skip_reason = ""
-        logger.info("[free_card] reminder injected group=%s account=%s", group, account)
+        logger.info("[free_card] reminder injected group=%s account=%s tools=%s->%s",
+                    group, account, len(tools), len(req.func_tool.tools))
 
     @filter.on_agent_begin()
     async def bind_reminder(
@@ -243,6 +271,20 @@ class FreeCardPlugin(WorldCardMixin, Star):
             logger.info("[free_card] reminder reached agent group=%s", event.get_group_id())
 
     def _cleanup(self, reminder: Reminder) -> None:
+        current = getattr(reminder.request, "func_tool", None)
+        gated = reminder.gated_tools
+        # The proactive runner may clone the ToolSet. Restore only our own gate;
+        # an empty or differently narrowed set may represent revoked permission.
+        if gated is not None and reminder.original_tools is not None and (
+            current is gated or (
+                len(getattr(current, "tools", [])) == len(gated.tools)
+                and all(a is b for a, b in zip(current.tools, gated.tools))
+            )
+        ):
+            reminder.request.func_tool = reminder.original_tools
+            logger.info("[free_card] restored follow-up tools group=%s tools=%s->%s",
+                        reminder.event.get_group_id(), len(gated.tools),
+                        len(reminder.original_tools.tools))
         parts = reminder.request.extra_user_content_parts
         parts[:] = [part for part in parts if part is not reminder.part]
         messages = getattr(reminder.run_context, "messages", None)
