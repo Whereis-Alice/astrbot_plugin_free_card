@@ -19,6 +19,7 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass as tool_dataclass
 
 from .card_api import compose_card, read_member, update_card, validate_card
+from .request_gate import CardCallPolicy, CardRequestGate
 from .world_card import (
     LEGACY_CHECK_VERSION,
     WorldCardMixin,
@@ -41,7 +42,9 @@ DEFAULT_REMINDER = (
     "工具返回后继续原来的回复或任务，不要把这段提醒复述给群友。"
 )
 REQUIRED_ACTION = (
-    "本轮请先实际调用 set_free_group_card 完成自主改名，再继续原来的回复或任务。"
+    "本次是新的独立改名提醒，历史中已经改过名也不能替代这一次调用。"
+    "下一条 assistant 行为必须直接调用 set_free_group_card，调用前不要输出自然语言。"
+    "名片内容由你根据本轮已有上下文自由决定，工具返回后继续原来的回复或任务。"
     "不要只在文字中声称已经改名，也不要等待用户再次要求；本轮不要重复调用。"
 )
 DEFAULT_TOOL_DESCRIPTION = (
@@ -67,6 +70,7 @@ class GroupState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reminded_at: float | None = None
     write_after: float = 0
+    remind_after: float = 0
     seen_at: float = field(default_factory=time.monotonic)
     last_skip_reason: str = ""
     skip_noticed_at: float = 0
@@ -80,6 +84,8 @@ class Reminder:
     key: tuple[str, str, str]
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
+    previous_reminded_at: float | None = None
+    policy: CardCallPolicy | None = None
     run_task: asyncio.Task | None = None
     run_context: Any = None
     original_tools: Any = None
@@ -130,6 +136,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
         self.config = config if config is not None else {}
         self._states: dict[tuple[str, str, str], GroupState] = {}
         self._reminders: dict[int, Reminder] = {}
+        self._request_gate = CardRequestGate()
         self._closed = False
         self._init_world_cards()
         self._tool = FreeCardTool(plugin=self)
@@ -279,6 +286,10 @@ class FreeCardPlugin(WorldCardMixin, Star):
             self._notice_reminder_skip(state, group, "write_cooldown",
                                        f"改名冷却尚未结束，剩余 {duration_text(state.write_after - now)}。")
             return
+        if now < state.remind_after:
+            self._notice_reminder_skip(state, group, "reminder_retry",
+                                       f"上次模型未调用工具，补提醒间隔剩余 {duration_text(state.remind_after - now)}。")
+            return
         if state.reminded_at is not None and now - state.reminded_at < interval:
             self._notice_reminder_skip(
                 state, group, "interval",
@@ -331,7 +342,14 @@ class FreeCardPlugin(WorldCardMixin, Star):
             if reminder.started_at is None:
                 reminder.started_at = time.monotonic()
                 reminder.run_task = asyncio.current_task()
-                self._state(event, reminder.key[2], reminder.key[1]).reminded_at = reminder.started_at
+                state = self._state(event, reminder.key[2], reminder.key[1])
+                reminder.previous_reminded_at = state.reminded_at
+                state.reminded_at = reminder.started_at
+                reminder.policy = CardCallPolicy(reminder.part.text, TOOL_NAME, reminder.key[2])
+                getter = getattr(self.context, "get_all_providers", None)
+                if not self._request_gate.bind(list(getter() or []) if callable(getter) else [], reminder.policy):
+                    logger.warning("[随心名片] 群 %s：未取得模型接口，本轮仅使用明确的工具调用提醒。",
+                                   reminder.key[2])
                 logger.info(
                     "[随心名片] 群 %s：模型已开始处理改名提醒，从现在计时；"
                     "要求先调用改名工具，名字由 bot 根据本轮已有上下文自由决定。",
@@ -339,6 +357,8 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 )
 
     def _cleanup(self, reminder: Reminder) -> None:
+        if reminder.policy is not None:
+            reminder.policy.active = False
         current = getattr(reminder.request, "func_tool", None)
         gated = reminder.gated_tools
         # The proactive runner may clone the ToolSet. Restore only our own gate;
@@ -400,9 +420,13 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 logger.info("[随心名片] 群 %s：请求在模型开始前结束，未执行改名；不计入提醒间隔。",
                             reminder.key[2])
             else:
+                state = self._state(event, reminder.key[2], reminder.key[1])
+                if state.reminded_at == reminder.started_at:
+                    state.reminded_at = reminder.previous_reminded_at
+                state.remind_after = time.monotonic() + 60
                 logger.warning(
                     "[随心名片] 群 %s：模型本轮结束，但没有调用改名工具；名片未由本轮修改。"
-                    "达到提醒间隔后，会在下一次合格请求中再次提醒。", reminder.key[2],
+                    "60 秒后可在下一次合格请求中补提醒，不会重新等待完整提醒间隔。", reminder.key[2],
                 )
             self._cleanup(reminder)
 
@@ -492,6 +516,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 completed_at = time.monotonic()
             if result.accepted:
                 state.reminded_at = completed_at
+                state.remind_after = 0
             if result.verified:
                 outcome = ("名片已是所选内容，无需重复写入：" if result.unchanged
                            else "改名成功，当前名片为")
@@ -509,6 +534,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
 
     async def terminate(self) -> None:
         self._closed = True
+        self._request_gate.close()
         self._tool.active = False
         try:
             await self._close_world_cards()

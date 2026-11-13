@@ -162,7 +162,7 @@ def test_elapsed_interval_reminds_again():
     req = request(plugin)
     asyncio.run(plugin.remind(event, req))
     asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
-    asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    plugin._cleanup(plugin._reminders[id(event)])
     plugin._state(event, "123", "456").reminded_at -= 1801
     next_req = request(plugin)
     asyncio.run(plugin.remind(Event(), next_req))
@@ -253,7 +253,7 @@ def test_interval_starts_once_when_agent_begins(monkeypatch):
     clock[0] = 1150.0
     asyncio.run(plugin.bind_reminder(event, SimpleNamespace(messages=[])))
     assert plugin._state(event, "123", "456").reminded_at == 1100.0
-    asyncio.run(plugin.finish_reminder(event, SimpleNamespace(messages=[]), None))
+    plugin._cleanup(plugin._reminders[id(event)])
     clock[0] = 1699.0
     early = request(plugin)
     asyncio.run(plugin.remind(Event(), early))
