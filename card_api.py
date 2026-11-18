@@ -108,13 +108,18 @@ class UpdateResult:
     verified: bool = False
     detail: str = ""
     unchanged: bool = False
+    previous: str | None = None
+    actual: str | None = None
 
 
 async def update_card(client: Any, group: str, account: str, name: str) -> UpdateResult:
     # Skip an unnecessary write only after a fresh check, never from local cache.
+    previous = None
+    actual = None
     try:
-        if await read_card(client, group, account) == name:
-            return UpdateResult(True, True, unchanged=True)
+        previous = await read_card(client, group, account)
+        if previous == name:
+            return UpdateResult(True, True, unchanged=True, previous=previous, actual=previous)
     except Exception as exc:  # noqa: BLE001 - OneBot wrappers use different exception classes.
         log.debug("Initial card read unavailable: %s", type(exc).__name__)
     accepted = False
@@ -132,9 +137,11 @@ async def update_card(client: Any, group: str, account: str, name: str) -> Updat
             actual = await read_card(client, group, account)
         except Exception as exc:  # noqa: BLE001 - Readback availability must be reported honestly.
             read_error = error_text(exc)
-            return UpdateResult(accepted, detail=f"{detail} {read_error}".strip())
+            return UpdateResult(accepted, detail=f"{detail} {read_error}".strip(),
+                                previous=previous, actual=actual)
         if actual == name:
-            return UpdateResult(True, True)
+            return UpdateResult(True, True, previous=previous, actual=actual)
         if not attempt:
             await asyncio.sleep(1)
-    return UpdateResult(False, detail=detail or "回读仍是其他名片，请检查 QQ 限制或其他改名插件。")
+    return UpdateResult(False, detail=detail or "回读仍是其他名片，请检查 QQ 限制或其他改名插件。",
+                        previous=previous, actual=actual)

@@ -401,7 +401,7 @@ def test_missing_v2_migrates_complete_legacy_slots_before_deleting_old_sdk_key(m
             expected = {"qq:456:123": legacy["qq:456:123"]}
             assert plugin._world_records == expected
             assert order == [("save", WORLD_RECORDS_KEY, expected), ("delete", LEGACY_WORLD_RECORDS_KEY)]
-            assert [call.args for call in plugin.get_kv_data.await_args_list] == [
+            assert [call.args for call in plugin.get_kv_data.await_args_list if call.args[0] != "card_management_v1"] == [
                 (WORLD_RECORDS_KEY, None), (LEGACY_WORLD_RECORDS_KEY, {})]
             assert plugin._world_task is not None
         finally:
@@ -420,7 +420,7 @@ def test_existing_v2_is_authoritative_and_legacy_cache_is_deleted_without_readin
         await plugin.initialize()
         try:
             assert plugin._world_records == current
-            plugin.get_kv_data.assert_awaited_once_with(WORLD_RECORDS_KEY, None)
+            assert [call.args for call in plugin.get_kv_data.await_args_list if call.args[0] != "card_management_v1"] == [(WORLD_RECORDS_KEY, None)]
             plugin.put_kv_data.assert_awaited_once_with(WORLD_RECORDS_KEY, current)
             plugin.delete_kv_data.assert_awaited_once_with(LEGACY_WORLD_RECORDS_KEY)
         finally:

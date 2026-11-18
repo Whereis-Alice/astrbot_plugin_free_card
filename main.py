@@ -19,6 +19,7 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass as tool_dataclass
 
 from .card_api import compose_card, read_member, update_card, validate_card
+from .management import CardManagement
 from .request_gate import CardCallPolicy, CardRequestGate
 from .world_card import (
     LEGACY_CHECK_VERSION,
@@ -48,7 +49,8 @@ REQUIRED_ACTION = (
     "不要只在文字中声称已经改名，也不要等待用户再次要求；本轮不要重复调用。"
 )
 DEFAULT_TOOL_DESCRIPTION = (
-    "自由修改你在当前 QQ 群中的完整群名片，表达你的名字、心情或当前状态。"
+    "自由重写你在当前 QQ 群中的完整群名片。可以是短句、意象、绰号或随心表达，"
+    "不必保留角色名或旧名，也不限于“角色名＋状态”的格式；是否使用自己的名字由你决定。"
     "只修改自己。card 是最终显示的完整文本，不会自动拼接基础名字或后缀。"
     "内容保持简短，最多 32 个字符且不超过 60 个 UTF-8 字节。"
     "收到自主改名提醒时，请先调用此工具；平常也可以按自己的意愿使用。"
@@ -139,9 +141,15 @@ class FreeCardPlugin(WorldCardMixin, Star):
         self._request_gate = CardRequestGate()
         self._closed = False
         self._init_world_cards()
+        self._management = CardManagement(self)
         self._tool = FreeCardTool(plugin=self)
         self._configure_tool()
         context.add_llm_tools(self._tool)
+
+    async def initialize(self) -> None:
+        await self._management.load()
+        await super().initialize()
+        self._management.register()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     @tracked_write
@@ -174,7 +182,11 @@ class FreeCardPlugin(WorldCardMixin, Star):
             return rule
         self._tool.description = DEFAULT_TOOL_DESCRIPTION
         self._tool.parameters["properties"]["card"]["description"] = "你想显示的完整群名片。"
-        return "未配置基础名字，card 填写你想显示的完整群名片，整个名字都可自由修改。"
+        return (
+            "未配置基础名字，card 填写最终显示的完整群名片。整个名片都可自由重写，"
+            "可以只用短句、意象或绰号，不必保留角色名或旧名，不限于“角色名＋状态”；"
+            "也可以自愿使用角色名，内容由你结合本轮已有上下文自由决定。"
+        )
 
     def _target(self, event: AstrMessageEvent) -> tuple[Any, str, str] | None:
         if event.get_platform_name() != "aiocqhttp":
@@ -256,9 +268,17 @@ class FreeCardPlugin(WorldCardMixin, Star):
         self._release_abandoned_reminders(time.monotonic())
         target = self._target(event)
         interval = setting_int(self.config, "reminder_interval_minutes", 30, 10080) * 60
-        if target is None or interval == 0:
+        if target is None:
             return
         _, group, account = target
+        control = self._management.control(self._world_key(event, group, account))
+        if control.get("paused"):
+            self._notice_reminder_skip(self._state(event, group, account), group, "paused",
+                                       "管理员已暂停此群的日常改名提醒；工具和小世界串门仍可使用。")
+            return
+        forced = control.get("next_chat", False)
+        if interval == 0 and not forced:
+            return
         state = self._state(event, group, account)
         try:
             if presence := await self._world_presence(event):
@@ -290,7 +310,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
             self._notice_reminder_skip(state, group, "reminder_retry",
                                        f"上次模型未调用工具，补提醒间隔剩余 {duration_text(state.remind_after - now)}。")
             return
-        if state.reminded_at is not None and now - state.reminded_at < interval:
+        if not forced and state.reminded_at is not None and now - state.reminded_at < interval:
             self._notice_reminder_skip(
                 state, group, "interval",
                 f"提醒间隔设为 {duration_text(interval)}，距上次实际提醒或成功改名"
@@ -345,6 +365,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 state = self._state(event, reminder.key[2], reminder.key[1])
                 reminder.previous_reminded_at = state.reminded_at
                 state.reminded_at = reminder.started_at
+                await self._management.consume_next_chat(self._world_key(event, reminder.key[2], reminder.key[1]))
                 reminder.policy = CardCallPolicy(reminder.part.text, TOOL_NAME, reminder.key[2])
                 getter = getattr(self.context, "get_all_providers", None)
                 if not self._request_gate.bind(list(getter() or []) if callable(getter) else [], reminder.policy):
@@ -431,14 +452,17 @@ class FreeCardPlugin(WorldCardMixin, Star):
             self._cleanup(reminder)
 
     @tracked_write
-    async def rename(self, event: AstrMessageEvent, card: Any) -> str:
+    async def rename(self, event: AstrMessageEvent, card: Any, *, origin: str = "tool") -> str:
         if self._closed:
             return "无法修改：插件已卸载。"
         if reminder := self._reminders.get(id(event)):
+            origin = "reminder"
             logger.info("[随心名片] 群 %s：bot 已响应定期提醒并调用改名工具。", event.get_group_id())
             self._cleanup(reminder)
-        else:
+        elif origin == "tool":
             logger.info("[随心名片] 群 %s：bot 调用了改名工具（本轮未附定期提醒）。", event.get_group_id())
+        else:
+            logger.info("[随心名片] 群 %s：管理员从管理面板提交改名。", event.get_group_id())
         target = self._target(event)
         if target is None:
             return "无法修改：仅支持 OneBot v11 接入的 QQ 群聊；QQ 官方机器人不开放群名片修改接口。"
@@ -502,17 +526,20 @@ class FreeCardPlugin(WorldCardMixin, Star):
                             world_row.clear()
                             world_row.update(previous)
                             raise
+                        await self._management.record(world_row, origin, "deferred", requested=name,
+                                                      previous=member["card"], actual=member["card"],
+                                                      detail="已保存日常名片，归家后恢复；当前串门名片未修改。")
                         return (f"正常名片已保存为“{name}”；串门期间继续显示“{slot['card']}”，"
                                 "归家后恢复刚保存的名字。")
                 name = slot["card"]
                 result = await self._write_world_slot(client, group, account, world_row, state, slot,
-                                                      updater=update_card)
+                                                      updater=update_card, source=origin)
                 completed_at = time.monotonic()
             else:
                 # Retain explicit intent without claiming an unconfirmed write succeeded.
                 slot = {"baseline": name, "card": name, "restore": True, "explicit_baseline": True}
                 result = await self._write_world_slot(client, group, account, world_row, state, slot,
-                                                      updater=update_card)
+                                                      updater=update_card, source=origin)
                 completed_at = time.monotonic()
             if result.accepted:
                 state.reminded_at = completed_at
@@ -534,6 +561,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
 
     async def terminate(self) -> None:
         self._closed = True
+        await self._management.close()
         self._request_gate.close()
         self._tool.active = False
         try:

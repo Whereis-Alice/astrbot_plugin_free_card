@@ -266,7 +266,7 @@ class WorldCardMixin:
 
     async def _write_world_slot(self, client: Any, group: str, account: str,
                                 row: dict[str, Any], state: Any, slot: dict[str, Any],
-                                *, updater=None):
+                                *, updater=None, source: str = "world"):
         row["pending_slot"] = dict(slot)
         await self._save_world_records()
         interval = self._world_interval()
@@ -275,11 +275,14 @@ class WorldCardMixin:
             result = await (updater or update_card)(client, group, account, slot["card"])
         except asyncio.CancelledError:
             state.write_after = time.monotonic() + 300
+            await self._management.record(row, source, "interrupted", requested=slot["card"],
+                                          detail="提交过程中被重载或取消，结果尚未确认；保留恢复记录。")
             raise
         state.write_after = time.monotonic() + (interval if result.accepted else 300)
         if result.verified:
             resolve_slot(row, slot["card"])
         await self._save_world_records()
+        await self._management.record_result(row, source, slot["card"], result)
         return result
 
     @tracked_write
@@ -342,7 +345,8 @@ class WorldCardMixin:
                     row.pop("pending_slot", None)
                     await self._save_world_records()
                     return True
-            result = await self._write_world_slot(client, group, account, row, state, slot)
+            result = await self._write_world_slot(client, group, account, row, state, slot,
+                                                  source="world" if presence else "world_restore")
             return result.verified
 
     async def _close_world_cards(self) -> None:
