@@ -38,7 +38,7 @@ PREPARED_REMINDER_TIMEOUT = 120
 RUNNING_REMINDER_TIMEOUT = 3600
 DEFAULT_REMINDER = (
     "现在到了你自主调整 QQ 群名片的时间。请先调用 set_free_group_card，"
-    "为自己自由决定一个简短的名字、心情或状态，按当前命名规则把文本传给 card。"
+    "为自己随心所欲地生成一个群名片，按当前命名规则把文本传给 card。"
     "内容由你决定，不必套用固定后缀，也不用等待群友要求改名。"
     "工具返回后继续原来的回复或任务，不要把这段提醒复述给群友。"
 )
