@@ -9,7 +9,7 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from .card_api import read_member, update_card, validate_card
+from .card_api import error_text, read_member, update_card, validate_card
 
 WORLD_PLUGIN = "astrbot_plugin_my_world"
 WORLD_RECORDS_KEY = "world_card_records_v2"
@@ -18,6 +18,7 @@ LEGACY_CHECK_VERSION = 2
 MAX_TARGETS = 1024
 SLOT_KEYS = ("confirmed_slot", "pending_slot")
 RENDER_VERSION = 2
+CHECK_FAILURE_COOLDOWN = 300
 
 
 def compose_presence(base: str, status: str) -> str:
@@ -123,9 +124,35 @@ class WorldCardMixin:
         if not self._closed:
             self._world_task = asyncio.create_task(self._world_card_loop(), name="free_card:world_presence")
 
-    def _world_log(self, text: str, exc: Exception) -> None:
+    def _world_log(self, text: str, exc: Exception, *, event: Any = None,
+                   row: dict[str, Any] | None = None, action: str = "") -> None:
         from astrbot.api import logger
-        logger.warning("[free_card] %s: %s", text, type(exc).__name__)
+        if row is None and event is not None:
+            row = {"platform": event.get_platform_id(), "group": event.get_group_id(),
+                   "account": event.get_self_id()}
+        row = row or {}
+        interface = f"接口 {action}；" if action else ""
+        logger.warning(
+            "[随心名片] 群 %s / 机器人 %s / 连接 %s：%s；%s%s（%s）。",
+            row.get("group", "未知"), row.get("account", "未知"), row.get("platform", "未知"),
+            text, interface, error_text(exc), type(exc).__name__,
+        )
+
+    def _world_check_failed(self, row: dict[str, Any], state: Any, exc: Exception,
+                            *, phase: str = "小世界临时名片后台检查失败", action: str = "") -> None:
+        state.check_after = time.monotonic() + CHECK_FAILURE_COOLDOWN
+        self._world_log(
+            f"{phase}；保留恢复记录，此群后台检查暂停 5 分钟，其他群照常处理",
+            exc, row=row, action=action,
+        )
+
+    def _world_read_recovered(self, row: dict[str, Any], state: Any) -> None:
+        if not state.check_after:
+            return
+        from astrbot.api import logger
+        state.check_after = 0
+        logger.info("[随心名片] 群 %s / 机器人 %s / 连接 %s：小世界后台名片回读已恢复，继续检查串门与归家恢复。",
+                    row["group"], row["account"], row["platform"])
 
     async def _save_world_records(self) -> None:
         writer = getattr(self, "put_kv_data", None)
@@ -250,6 +277,9 @@ class WorldCardMixin:
             for key, row in list(self._world_records.items()):
                 if self._closed:
                     break
+                state = self._states.get((row["platform"], row["account"], row["group"]))
+                if state is not None and time.monotonic() < state.check_after:
+                    continue
                 try:
                     event = self._world_recovered_event(key, row)
                     if event is not None:
@@ -257,7 +287,11 @@ class WorldCardMixin:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - One unavailable target must not stop others.
-                    self._world_log("Temporary group-card check failed", exc)
+                    if state is None:
+                        from .main import GroupState
+                        state = self._states.setdefault(
+                            (row["platform"], row["account"], row["group"]), GroupState())
+                    self._world_check_failed(row, state, exc)
             await asyncio.sleep(30)
 
     def _world_interval(self) -> int:
@@ -294,7 +328,7 @@ class WorldCardMixin:
         row = await self._track_world_target(event, target)
         state = self._state(event, group, account)
         async with state.lock:
-            if self._closed or time.monotonic() < state.write_after:
+            if self._closed or time.monotonic() < max(state.write_after, state.check_after):
                 return False
             presence = await self._world_presence(event, current_event=False)
             confirmed = row.get("confirmed_slot") or {}
@@ -312,7 +346,12 @@ class WorldCardMixin:
             if (row.get("legacy_world_checked") == LEGACY_CHECK_VERSION and not presence
                     and not any(row.get(key) for key in SLOT_KEYS)):
                 return False
-            member = await read_member(client, group, account)
+            try:
+                member = await read_member(client, group, account)
+            except Exception as exc:  # noqa: BLE001 - Never alter restoration slots from a failed read.
+                self._world_check_failed(row, state, exc, phase="小世界临时名片回读失败，本轮未提交修改",
+                                         action="get_group_member_info")
+                return False
             current = member["card"]
             owned = resolve_slot(row, current)
             baseline = owned["baseline"] if owned is not None else current
@@ -327,6 +366,7 @@ class WorldCardMixin:
                     elif not presence:
                         owned = {"card": current, "baseline": clean}
                         row["confirmed_slot"] = owned
+            self._world_read_recovered(row, state)
             if not presence:
                 if owned is None:
                     await self._save_world_records()

@@ -73,6 +73,7 @@ class GroupState:
     reminded_at: float | None = None
     write_after: float = 0
     remind_after: float = 0
+    check_after: float = 0
     seen_at: float = field(default_factory=time.monotonic)
     last_skip_reason: str = ""
     skip_noticed_at: float = 0
@@ -485,7 +486,7 @@ class FreeCardPlugin(WorldCardMixin, Star):
             try:
                 presence = await self._world_presence(event)
             except Exception as exc:  # noqa: BLE001 - Preserve a pending temporary name while its owner reloads.
-                self._world_log("World presence is not ready", exc)
+                self._world_log("小世界串门状态暂不可用，本次未提交改名", exc, event=event)
                 return "小世界正在恢复状态，暂时保留当前名片，稍后再试。"
             logger.info("[随心名片] 群 %s / 机器人 %s：bot 选择名片“%s”，开始核对并提交 QQ。",
                         group, account, name)
@@ -496,7 +497,8 @@ class FreeCardPlugin(WorldCardMixin, Star):
                 try:
                     member = await read_member(client, group, account)
                 except Exception as exc:  # noqa: BLE001 - A failed read must preserve restoration slots.
-                    self._world_log("Group-card read unavailable", exc)
+                    self._world_log("当前群名片回读失败，保留恢复记录并暂停尝试 5 分钟", exc,
+                                    event=event, action="get_group_member_info")
                     state.write_after = time.monotonic() + 300
                     return "暂时无法回读当前群名片，已保留恢复记录并暂停尝试 300 秒，请稍后再试。"
                 owned = resolve_slot(world_row, member["card"])
@@ -507,7 +509,8 @@ class FreeCardPlugin(WorldCardMixin, Star):
                         try:
                             member = await read_member(client, group, account)
                         except Exception as exc:  # noqa: BLE001 - Do not overwrite an unread temporary card.
-                            self._world_log("Group-card read unavailable", exc)
+                            self._world_log("当前群名片回读失败，暂停尝试 5 分钟", exc,
+                                            event=event, action="get_group_member_info")
                             state.write_after = time.monotonic() + 300
                             return "暂时无法回读当前群名片，已暂停尝试 300 秒，请稍后再试。"
                     display = presence_display_base(self.config, presence, member=member, baseline=name)

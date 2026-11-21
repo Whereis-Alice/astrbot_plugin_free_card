@@ -1,12 +1,13 @@
 """Actual card values, interrupted writes, lifecycle and ownership boundaries."""
 import asyncio
 import copy
+import time
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
 
-from free_card_plugin.card_api import UpdateResult
+from free_card_plugin.card_api import ApiFailure, UpdateResult
 from free_card_plugin.main import FreeCardPlugin
 from free_card_plugin.world_card import (
     LEGACY_CHECK_VERSION,
@@ -773,4 +774,113 @@ def test_failed_same_display_local_save_rolls_back_explicit_baseline_marker(monk
         situation["presence"] = None
         await plugin.sync_world_group_card(event)
         assert event.bot.card == "Alice"
+    asyncio.run(scenario())
+
+
+def authority_failure():
+    failure = ApiFailure()
+    failure.result = {"status": "failed", "retcode": 1200,
+                      "message": "TaskGetGroupMemberList 0x899_AUTHORITY_FAIL"}
+    return failure
+
+
+@pytest.mark.parametrize("slot_kind", [None, "confirmed_slot", "pending_slot"])
+def test_background_read_failure_preserves_slots_and_suppresses_repeated_reads(monkeypatch, caplog, slot_kind):
+    async def scenario():
+        plugin, event, situation, updater = fixture(monkeypatch)
+        await plugin.remember_world_target(event)
+        row = plugin._world_records["qq:456:123"]
+        if slot_kind:
+            row[slot_kind] = {"card": "Alice 拜访艾拉", "baseline": "Alice original"}
+        original = copy.deepcopy({key: row.get(key) for key in ("confirmed_slot", "pending_slot", "legacy_world_checked")})
+        reader = AsyncMock(side_effect=authority_failure())
+        monkeypatch.setattr("free_card_plugin.world_card.read_member", reader)
+        with caplog.at_level("WARNING"):
+            assert not await plugin.sync_world_group_card(event)
+            for _ in range(3):
+                assert not await plugin.sync_world_group_card(event)
+        assert reader.await_count == 1
+        updater.assert_not_awaited()
+        assert {key: row.get(key) for key in original} == original
+        state = plugin._state(event, "123", "456")
+        assert state.check_after > time.monotonic() + 290
+        assert state.write_after == 0 and state.reminded_at is None
+        assert len(plugin._management.history) == 0
+        assert all(text in caplog.text for text in (
+            "群 123 / 机器人 456 / 连接 qq", "get_group_member_info", "retcode=1200",
+            "0x899_AUTHORITY_FAIL", "本轮未提交修改", "后台检查暂停 5 分钟"))
+        assert caplog.text.count("后台检查暂停 5 分钟") == 1
+    asyncio.run(scenario())
+
+
+def test_background_read_recovers_and_restores_exact_baseline_after_cooldown(monkeypatch, caplog):
+    async def scenario():
+        baseline = "Alice original | 自选名字"
+        plugin, event, situation, updater = fixture(monkeypatch, card=baseline)
+        assert await plugin.sync_world_group_card(event)
+        temporary = event.bot.card
+        situation["presence"] = None
+        reader = AsyncMock(side_effect=[authority_failure(), {"card": temporary, "group_id": 123, "user_id": 456}])
+        monkeypatch.setattr("free_card_plugin.world_card.read_member", reader)
+        with caplog.at_level("INFO"):
+            assert not await plugin.sync_world_group_card(event)
+            assert event.bot.card == temporary
+            plugin._state(event, "123", "456").check_after -= 301
+            assert await plugin.sync_world_group_card(event)
+        assert event.bot.card == baseline and updater.await_count == 2
+        assert plugin._state(event, "123", "456").check_after == 0
+        assert "后台名片回读已恢复" in caplog.text
+        assert not plugin._world_records["qq:456:123"].get("confirmed_slot")
+    asyncio.run(scenario())
+
+
+def test_background_read_cooldown_does_not_disable_daily_rename(monkeypatch):
+    async def scenario():
+        plugin, event, situation, updater = fixture(monkeypatch)
+        situation["presence"] = None
+        monkeypatch.setattr("free_card_plugin.world_card.read_member", AsyncMock(side_effect=authority_failure()))
+        assert not await plugin.sync_world_group_card(event)
+        assert "已确认" in await plugin.rename(event, "自由的新名字")
+        assert event.bot.card == "自由的新名字" and updater.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_background_loop_isolates_failed_target_and_continues_other_connections(monkeypatch):
+    async def scenario():
+        plugin, event, _, _ = fixture(monkeypatch)
+        second = NS(**vars(event))
+        second.get_platform_id = lambda: "qq2"
+        second.unified_msg_origin = "qq2:GroupMessage:123"
+        await plugin.remember_world_target(event)
+        await plugin.remember_world_target(second)
+        seen = []
+        async def check(target):
+            seen.append(target.get_platform_id())
+            if target.get_platform_id() == "qq":
+                raise authority_failure()
+            return True
+        waits = 0
+        async def next_tick(_seconds):
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                plugin._closed = True
+        monkeypatch.setattr(plugin, "sync_world_group_card", check)
+        monkeypatch.setattr("free_card_plugin.world_card.asyncio.sleep", next_tick)
+        await plugin._world_card_loop()
+        assert seen == ["qq", "qq2", "qq2"]
+        assert plugin._states[("qq", "456", "123")].check_after > 0
+        assert ("qq2", "456", "123") not in plugin._states
+    asyncio.run(scenario())
+
+
+def test_canceling_background_read_does_not_turn_shutdown_into_a_retry(monkeypatch):
+    async def scenario():
+        plugin, event, _, updater = fixture(monkeypatch)
+        monkeypatch.setattr("free_card_plugin.world_card.read_member", AsyncMock(side_effect=asyncio.CancelledError()))
+        with pytest.raises(asyncio.CancelledError):
+            await plugin.sync_world_group_card(event)
+        assert plugin._state(event, "123", "456").check_after == 0
+        updater.assert_not_awaited()
+        assert not plugin._card_writers
     asyncio.run(scenario())
