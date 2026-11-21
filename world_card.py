@@ -343,8 +343,10 @@ class WorldCardMixin:
                     and confirmed.get("display_base") == display[0]
                     and confirmed.get("display_source") == display[1]):
                 return True
-            if (row.get("legacy_world_checked") == LEGACY_CHECK_VERSION and not presence
-                    and not any(row.get(key) for key in SLOT_KEYS)):
+            # An unchecked legacy marker alone is not a reason to inspect an
+            # ordinary group. Only an active visit or a saved restoration slot
+            # permits background QQ reads and legacy-baseline verification.
+            if not presence and not any(row.get(key) for key in SLOT_KEYS):
                 return False
             try:
                 member = await read_member(client, group, account)

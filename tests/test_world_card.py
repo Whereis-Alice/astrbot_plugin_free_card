@@ -445,7 +445,8 @@ def test_failed_v2_save_keeps_legacy_key_and_does_not_start_background_writer(mo
     asyncio.run(scenario())
 
 
-def test_proven_old_world_name_is_cleaned_without_active_visit_and_only_checked_once(monkeypatch):
+@pytest.mark.parametrize("legacy_marker", [None, True, LEGACY_CHECK_VERSION])
+def test_idle_group_without_restoration_never_reads_or_changes_qq_even_with_legacy_proof(monkeypatch, legacy_marker):
     async def scenario():
         old = "Alice 摸鱼中 | 事件中"
         clean = "Alice 摸鱼中"
@@ -453,16 +454,18 @@ def test_proven_old_world_name_is_cleaned_without_active_visit_and_only_checked_
         situation["presence"] = None
         situation["baseline_proofs"][old] = clean
         helper = plugin.context.get_all_stars()[0].star_cls.get_group_card_baseline
-        assert await plugin.sync_world_group_card(event)
-        assert event.bot.card == clean
-        row = next(iter(plugin._world_records.values()))
-        assert row["legacy_world_checked"] and not row.get("confirmed_slot")
-        helper.assert_awaited_once_with(event.unified_msg_origin, old)
-        reads, writes = event.bot.read_count, updater.await_count
+        await plugin.remember_world_target(event)
+        row = plugin._world_records["qq:456:123"]
+        if legacy_marker is not None:
+            row["legacy_world_checked"] = legacy_marker
         for _ in range(5):
-            await plugin.sync_world_group_card(event)
-        assert event.bot.read_count == reads and updater.await_count == writes
-        assert helper.await_count == 1
+            assert not await plugin.sync_world_group_card(event)
+        assert event.bot.card == old and event.bot.read_count == 0
+        assert not row.get("confirmed_slot") and not row.get("pending_slot")
+        assert row.get("legacy_world_checked") == legacy_marker
+        assert plugin._state(event, "123", "456").check_after == 0
+        helper.assert_not_awaited()
+        updater.assert_not_awaited()
     asyncio.run(scenario())
 
 
@@ -522,11 +525,13 @@ def test_unproven_external_new_name_is_preserved_even_when_it_contains_a_pipe(mo
     asyncio.run(scenario())
 
 
-def test_unavailable_old_writer_leaves_check_pending_until_proof_can_be_read(monkeypatch):
+def test_unavailable_old_writer_leaves_saved_restoration_pending_until_proof_can_be_read(monkeypatch):
     async def scenario():
         old = "Alice | 事件中"
         plugin, event, situation, updater = fixture(monkeypatch, card=old)
         situation["presence"] = None
+        await plugin.remember_world_target(event)
+        plugin._world_records["qq:456:123"]["confirmed_slot"] = {"card": old, "baseline": old}
         helper = plugin.context.get_all_stars()[0].star_cls.get_group_card_baseline
         helper.side_effect = RuntimeError("world database is recovering")
         with pytest.raises(RuntimeError, match="recovering"):
@@ -601,6 +606,7 @@ def test_old_boolean_check_rechecks_newly_proven_visit_suffix_once(monkeypatch, 
         else:
             situation["presence"] = None
             await plugin.remember_world_target(event)
+            plugin._world_records["qq:456:123"]["confirmed_slot"] = {"card": old, "baseline": old}
         row = plugin._world_records["qq:456:123"]
         row["legacy_world_checked"] = True
         situation["baseline_proofs"][old] = clean
@@ -838,6 +844,8 @@ def test_background_read_cooldown_does_not_disable_daily_rename(monkeypatch):
     async def scenario():
         plugin, event, situation, updater = fixture(monkeypatch)
         situation["presence"] = None
+        await plugin.remember_world_target(event)
+        plugin._world_records["qq:456:123"]["pending_slot"] = {"card": "unknown temporary", "baseline": "Alice"}
         monkeypatch.setattr("free_card_plugin.world_card.read_member", AsyncMock(side_effect=authority_failure()))
         assert not await plugin.sync_world_group_card(event)
         assert "已确认" in await plugin.rename(event, "自由的新名字")
